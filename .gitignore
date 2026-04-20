@@ -18,3 +18,4 @@ app_test/
 firmware/build
 .codex/
 .vscode/
+model/lightwake/target
