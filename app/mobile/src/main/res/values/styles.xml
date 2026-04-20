@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.VoiceCollector" parent="Theme.AppCompat.Light.DarkActionBar">
+        <item name="colorPrimary">#006B5F</item>
+        <item name="colorPrimaryDark">#004D43</item>
+        <item name="colorAccent">#D97706</item>
+    </style>
+</resources>

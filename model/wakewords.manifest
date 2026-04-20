@@ -1,0 +1,9 @@
+# Voice Collector wakeword manifest
+protocol_version=1
+keyword_set_version=1
+engine=lightwake
+audio_sample_rate=16000
+audio_channels=1
+bits_per_sample=16
+frame_ms=30
+lightwake_model=lightwake/voice_commands.lww
