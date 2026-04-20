@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::LightwakeError;
+use lightwake::LightwakeError;
 
 pub struct NormalizedDataset {
     pub positive_dirs: Vec<PathBuf>,
@@ -12,6 +12,23 @@ pub struct NormalizedDataset {
 }
 
 impl Drop for NormalizedDataset {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.temp_root);
+    }
+}
+
+pub struct NormalizedInput {
+    wav_path: PathBuf,
+    temp_root: PathBuf,
+}
+
+impl NormalizedInput {
+    pub fn wav_path(&self) -> &Path {
+        &self.wav_path
+    }
+}
+
+impl Drop for NormalizedInput {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.temp_root);
     }
@@ -44,17 +61,35 @@ pub fn normalize_dataset(
     })
 }
 
+pub fn normalize_input_wav(
+    source_path: &Path,
+    sample_rate: u32,
+) -> Result<NormalizedInput, LightwakeError> {
+    ensure_ffmpeg_available()?;
+
+    let temp_root = build_temp_root()?;
+    fs::create_dir_all(&temp_root)?;
+
+    let destination_path = temp_root.join("normalized_input.wav");
+    normalize_file(source_path, &destination_path, sample_rate)?;
+
+    Ok(NormalizedInput {
+        wav_path: destination_path,
+        temp_root,
+    })
+}
+
 fn ensure_ffmpeg_available() -> Result<(), LightwakeError> {
-    let status = Command::new("ffmpeg")
+    let output = Command::new("ffmpeg")
         .arg("-version")
-        .status()
+        .output()
         .map_err(|error| {
             LightwakeError::InvalidArgument(format!(
                 "ffmpeg is required for auto-normalization but could not be launched: {error}"
             ))
         })?;
 
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
         Err(LightwakeError::InvalidArgument(

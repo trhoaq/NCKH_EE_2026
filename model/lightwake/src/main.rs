@@ -1,7 +1,7 @@
 mod ffmpeg_normalize;
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use lightwake::{build_model, read_wav_i16, BuildConfig, Example, LightwakeError, LightwakeModel};
 
@@ -34,6 +34,7 @@ fn run_build(arguments: Vec<String>) -> Result<(), LightwakeError> {
     let mut negative_source_dir = None::<PathBuf>;
     let mut output = None::<PathBuf>;
     let mut sample_rate = 16_000u32;
+    let mut threshold_margin = BuildConfig::default().threshold_margin;
 
     let mut index = 0usize;
     while index < arguments.len() {
@@ -63,6 +64,15 @@ fn run_build(arguments: Vec<String>) -> Result<(), LightwakeError> {
                     .map_err(|_| {
                         LightwakeError::InvalidArgument(
                             "sample rate must be an integer".to_string(),
+                        )
+                    })?;
+            }
+            "--threshold-margin" => {
+                threshold_margin = next_value(&arguments, &mut index, "--threshold-margin")?
+                    .parse()
+                    .map_err(|_| {
+                        LightwakeError::InvalidArgument(
+                            "threshold margin must be a number".to_string(),
                         )
                     })?;
             }
@@ -107,7 +117,7 @@ fn run_build(arguments: Vec<String>) -> Result<(), LightwakeError> {
         &negatives,
         &BuildConfig {
             sample_rate,
-            ..BuildConfig::default()
+            threshold_margin,
         },
     )?;
     model.save(&output)?;
@@ -145,12 +155,24 @@ fn run_detect(arguments: Vec<String>) -> Result<(), LightwakeError> {
         index += 1;
     }
 
-    let model = LightwakeModel::load(&model_path.ok_or_else(|| {
+    let model_path = model_path.ok_or_else(|| {
         LightwakeError::InvalidArgument("missing --model for detect command".to_string())
-    })?)?;
-    let wav = read_wav_i16(&input_path.ok_or_else(|| {
+    })?;
+    let input_path = input_path.ok_or_else(|| {
         LightwakeError::InvalidArgument("missing --input for detect command".to_string())
-    })?)?;
+    })?;
+
+    let model = LightwakeModel::load(Path::new(&model_path))?;
+    let (wav, _normalized_input) = match read_wav_i16(Path::new(&input_path)) {
+        Ok(wav) => (wav, None),
+        Err(LightwakeError::InvalidWav(_)) => {
+            let normalized_input =
+                ffmpeg_normalize::normalize_input_wav(Path::new(&input_path), model.sample_rate)?;
+            let wav = read_wav_i16(normalized_input.wav_path())?;
+            (wav, Some(normalized_input))
+        }
+        Err(error) => return Err(error),
+    };
 
     match model.detect_pcm(&wav.samples, wav.sample_rate) {
         Some(detection) => {
