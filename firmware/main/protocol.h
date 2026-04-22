@@ -14,6 +14,7 @@ typedef enum {
     VCP_PACKET_STATE = 5,
     VCP_PACKET_DETECTION = 6,
     VCP_PACKET_ERROR = 7,
+    VCP_PACKET_COMMAND = 8,
 } vcp_packet_type_t;
 
 typedef enum {
@@ -36,6 +37,7 @@ typedef enum {
     VCP_ERROR_DETECTOR_NOT_READY = 3,
     VCP_ERROR_BAD_SESSION = 4,
     VCP_ERROR_INTERNAL = 5,
+    VCP_ERROR_UNSUPPORTED_ACTION = 6,
 } vcp_error_code_t;
 
 typedef struct __attribute__((packed)) {
@@ -85,6 +87,13 @@ typedef struct __attribute__((packed)) {
     uint16_t keyword_length;
     uint32_t score_milli;
 } vcp_detection_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t request_id;
+    uint16_t action_id;
+    uint16_t keyword_length;
+    uint32_t score_milli;
+} vcp_command_payload_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t session_id;

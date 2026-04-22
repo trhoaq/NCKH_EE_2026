@@ -3,8 +3,6 @@ package com.nckh.voicecollector;
 import android.Manifest;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.media.AudioFormat;
-import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Handler;
@@ -48,9 +46,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String DEFAULT_BACKEND_URL = "http://10.0.2.2:3000";
     private static final String DEFAULT_ESP_HOST = "192.168.4.1";
     private static final String DEFAULT_ESP_PORT = "3333";
-    private static final int KEYWORD_SET_VERSION = 1;
-    private static final double ESP_RMS_THRESHOLD = 1100.0;
-    private static final int ESP_SILENCE_HANGOVER_FRAMES = 10;
+    private static final String COMMAND_MODEL_ASSET = "command_model.tflite";
+    private static final String COMMAND_MODEL_META_ASSET = "command_model_meta.json";
 
     private final VoiceBackendClient backendClient = new VoiceBackendClient();
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
@@ -79,12 +76,10 @@ public class MainActivity extends AppCompatActivity {
     private File pendingUploadFile;
     private long recordingStartedAtMs;
     private long pendingDurationMs;
-    private volatile boolean shouldRunEspLoop;
-    private volatile AudioRecord audioRecord;
     private volatile EspAudioClient activeEspClient;
-    private Thread espStreamingThread;
     private boolean isRecording;
     private boolean isUploading;
+    private StreamingCommandRecognizer commandRecognizer;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -183,7 +178,7 @@ public class MainActivity extends AppCompatActivity {
         stopButton.setText(espMode ? R.string.stop_listening : R.string.stop_recording);
         if (espMode) {
             recordingAdapter.submitList(Collections.emptyList());
-            updateStatus("ESP direct mode ready");
+            updateStatus("ESP command mode ready");
         } else {
             updateStatus("Backend mode ready");
         }
@@ -344,116 +339,139 @@ public class MainActivity extends AppCompatActivity {
         }
 
         isRecording = true;
-        shouldRunEspLoop = true;
         renderButtonState();
         updateStatus("Connecting to ESP " + host + ":" + port + "...");
 
-        espStreamingThread = new Thread(() -> runEspListeningLoop(host, port), "esp-stream-thread");
-        espStreamingThread.start();
+        ioExecutor.execute(() -> {
+            EspAudioClient client = new EspAudioClient(host, port);
+            try {
+                client.connectAndReadHello();
+                activeEspClient = client;
+                mainHandler.post(() -> {
+                    lastDetectionTextView.setText(getString(R.string.last_detection_empty));
+                    updateStatus("ESP connected. Starting DL recognizer...");
+                    startCommandRecognizer();
+                });
+            } catch (IOException error) {
+                try {
+                    client.close();
+                } catch (IOException ignored) {
+                    // Ignore close failure.
+                }
+                activeEspClient = null;
+                isRecording = false;
+                mainHandler.post(() -> {
+                    updateStatus("ESP direct mode failed: " + error.getMessage());
+                    renderButtonState();
+                });
+            }
+        });
+    }
+
+    private void startCommandRecognizer() {
+        stopCommandRecognizer();
+        commandRecognizer = new StreamingCommandRecognizer(
+                this,
+                COMMAND_MODEL_ASSET,
+                COMMAND_MODEL_META_ASSET,
+                new StreamingCommandRecognizer.Listener() {
+                    @Override
+                    public void onCommandDetected(TfliteCommandClassifier.Prediction prediction) {
+                        mainHandler.post(() -> handleDetectedCommand(prediction));
+                    }
+
+                    @Override
+                    public void onStatus(String message) {
+                        mainHandler.post(() -> updateStatus(message));
+                    }
+
+                    @Override
+                    public void onError(String message) {
+                        mainHandler.post(() -> {
+                            updateStatus(message);
+                            stopEspListening();
+                        });
+                    }
+                }
+        );
+
+        try {
+            commandRecognizer.start();
+        } catch (IOException error) {
+            updateStatus("Could not start DL recognizer: " + error.getMessage());
+            stopEspListening();
+        }
+    }
+
+    private void stopCommandRecognizer() {
+        if (commandRecognizer != null) {
+            commandRecognizer.stop();
+            commandRecognizer = null;
+        }
+    }
+
+    private void handleDetectedCommand(TfliteCommandClassifier.Prediction prediction) {
+        if (!isRecording) {
+            return;
+        }
+        String pendingMessage = String.format(
+                Locale.US,
+                "Detected \"%s\" (%.3f)",
+                prediction.label,
+                prediction.confidence
+        );
+        lastDetectionTextView.setText(pendingMessage);
+        updateStatus("Sending command to ESP...");
+        dispatchEspCommand(prediction);
     }
 
     private void stopEspListening() {
-        shouldRunEspLoop = false;
-        AudioRecord currentAudioRecord = audioRecord;
-        if (currentAudioRecord != null) {
-            try {
-                currentAudioRecord.stop();
-            } catch (IllegalStateException ignored) {
-                // The background thread may have already released the recorder.
-            }
-        }
+        boolean wasRunning = isRecording;
+        isRecording = false;
+        stopCommandRecognizer();
+
         EspAudioClient currentClient = activeEspClient;
+        activeEspClient = null;
         if (currentClient != null) {
-            try {
-                currentClient.close();
-            } catch (IOException ignored) {
-                // The socket is already closing.
-            }
+            ioExecutor.execute(() -> {
+                try {
+                    currentClient.close();
+                } catch (IOException ignored) {
+                    // Already closing.
+                }
+            });
         }
-        updateStatus("Stopping ESP listening...");
+
+        if (wasRunning) {
+            updateStatus("ESP command listening stopped");
+        }
+        renderButtonState();
     }
 
-    private void runEspListeningLoop(String host, int port) {
-        EspAudioClient client = new EspAudioClient(host, port);
-        activeEspClient = client;
-
-        try {
-            EspAudioClient.ServerHello hello = client.connectAndReadHello();
-            if (!hello.detectorReady || hello.wakewordCount <= 0) {
-                throw new IOException("ESP wakeword engine is not ready. Flash a firmware with models first.");
+    private void dispatchEspCommand(TfliteCommandClassifier.Prediction prediction) {
+        ioExecutor.execute(() -> {
+            EspAudioClient client = activeEspClient;
+            if (client == null) {
+                mainHandler.post(() -> {
+                    updateStatus("ESP connection closed");
+                    stopEspListening();
+                });
+                return;
             }
 
-            postStatus(String.format(
-                    Locale.US,
-                    "ESP ready: %dHz, frame=%d, models=%d",
-                    hello.sampleRate,
-                    hello.frameSamples,
-                    hello.wakewordCount
-            ));
-
-            AudioRecord localAudioRecord = createAudioRecord(hello.sampleRate, hello.frameSamples);
-            audioRecord = localAudioRecord;
-            localAudioRecord.startRecording();
-
-            short[] frameBuffer = new short[hello.frameSamples];
-            boolean sessionActive = false;
-            int activeSessionId = 0;
-            int sequence = 0;
-            int remainingVoiceFrames = 0;
-
-            while (shouldRunEspLoop) {
-                int samplesRead = readFullFrame(localAudioRecord, frameBuffer, hello.frameSamples);
-                if (samplesRead <= 0) {
-                    throw new IOException("Could not read a full frame from microphone");
-                }
-
-                boolean voiceDetected = isVoiceDetected(frameBuffer, samplesRead);
-                if (voiceDetected && !sessionActive) {
-                    activeSessionId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
-                    client.sendSessionStart(activeSessionId, hello, KEYWORD_SET_VERSION);
-                    sessionActive = true;
-                    sequence = 0;
-                    remainingVoiceFrames = ESP_SILENCE_HANGOVER_FRAMES;
-                    postStatus("Voice segment started, streaming to ESP...");
-                }
-
-                if (sessionActive) {
-                    client.sendAudioFrame(activeSessionId, sequence++, frameBuffer, samplesRead);
-                    consumePollResult(client.drainResponses());
-
-                    if (voiceDetected) {
-                        remainingVoiceFrames = ESP_SILENCE_HANGOVER_FRAMES;
-                    } else {
-                        remainingVoiceFrames--;
-                    }
-
-                    if (!voiceDetected && remainingVoiceFrames <= 0) {
-                        client.sendSessionEnd(activeSessionId, sequence);
-                        consumePollResult(client.drainResponses());
-                        sessionActive = false;
-                        postStatus("Voice segment ended, waiting for next wakeword...");
-                    }
-                }
-            }
-
-            if (sessionActive) {
-                client.sendSessionEnd(activeSessionId, sequence);
-                consumePollResult(client.drainResponses());
-            }
-        } catch (IOException error) {
-            postStatus("ESP direct mode failed: " + error.getMessage());
-        } finally {
-            activeEspClient = null;
-            releaseAudioRecord();
             try {
-                client.close();
-            } catch (IOException ignored) {
-                // Already disconnected.
+                int requestId = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
+                client.sendCommand(requestId, prediction.actionId, prediction.label, prediction.confidence);
+                EspAudioClient.PollResult pollResult = client.drainResponses();
+                mainHandler.post(() -> consumePollResult(pollResult, prediction));
+            } catch (IOException error) {
+                activeEspClient = null;
+                mainHandler.post(() -> {
+                    updateStatus("Failed to send command to ESP: " + error.getMessage());
+                    stopEspListening();
+                });
             }
-            shouldRunEspLoop = false;
-            isRecording = false;
-            mainHandler.post(this::renderButtonState);
-        }
+        });
     }
 
     private void checkEspConnection() {
@@ -472,11 +490,8 @@ public class MainActivity extends AppCompatActivity {
                 mainHandler.post(() -> {
                     updateStatus(String.format(
                             Locale.US,
-                            "ESP online: %dHz, frame=%d, models=%d, ready=%s",
-                            hello.sampleRate,
-                            hello.frameSamples,
-                            hello.wakewordCount,
-                            hello.detectorReady ? "yes" : "no"
+                            "ESP online: protocol=%d",
+                            hello.protocolVersion
                     ));
                     lastDetectionTextView.setText(getString(R.string.last_detection_empty));
                 });
@@ -540,24 +555,11 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void releaseAudioRecord() {
-        AudioRecord currentAudioRecord = audioRecord;
-        audioRecord = null;
-        if (currentAudioRecord != null) {
-            try {
-                currentAudioRecord.release();
-            } catch (Exception ignored) {
-                // Ignore cleanup errors while shutting down the capture pipeline.
-            }
-        }
-    }
-
     @Override
     protected void onDestroy() {
         super.onDestroy();
         stopEspListening();
         releaseRecorder();
-        releaseAudioRecord();
         ioExecutor.shutdownNow();
     }
 
@@ -589,69 +591,33 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private AudioRecord createAudioRecord(int sampleRate, int frameSamples) throws IOException {
-        int minBufferSize = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-        );
-        if (minBufferSize <= 0) {
-            throw new IOException("AudioRecord buffer size invalid for " + sampleRate + "Hz");
-        }
-        int bufferSize = Math.max(minBufferSize, frameSamples * 8);
-        AudioRecord localAudioRecord = new AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize
-        );
-        if (localAudioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
-            throw new IOException("AudioRecord did not initialize");
-        }
-        return localAudioRecord;
-    }
-
-    private int readFullFrame(AudioRecord localAudioRecord, short[] buffer, int targetSamples) {
-        int totalRead = 0;
-        while (totalRead < targetSamples && shouldRunEspLoop) {
-            int readCount = localAudioRecord.read(buffer, totalRead, targetSamples - totalRead);
-            if (readCount <= 0) {
-                return readCount;
-            }
-            totalRead += readCount;
-        }
-        return totalRead;
-    }
-
-    private boolean isVoiceDetected(short[] samples, int sampleCount) {
-        double energySum = 0.0;
-        for (int index = 0; index < sampleCount; index++) {
-            energySum += samples[index] * (double) samples[index];
-        }
-        double rms = Math.sqrt(energySum / Math.max(sampleCount, 1));
-        return rms >= ESP_RMS_THRESHOLD;
-    }
-
-    private void consumePollResult(EspAudioClient.PollResult pollResult) {
+    private void consumePollResult(EspAudioClient.PollResult pollResult, TfliteCommandClassifier.Prediction fallbackPrediction) {
         if (pollResult.lastState != null) {
             postStatus("ESP state: " + pollResult.lastState.stateLabel);
         }
         if (pollResult.lastError != null) {
-            postStatus(pollResult.lastError);
+            updateStatus(pollResult.lastError);
+            return;
         }
-        for (EspAudioClient.Detection detection : pollResult.detections) {
-            final String message = String.format(
+
+        if (!pollResult.detections.isEmpty()) {
+            EspAudioClient.Detection detection = pollResult.detections.get(pollResult.detections.size() - 1);
+            String message = String.format(
                     Locale.US,
-                    "Detected %s (%s, score=%.3f)",
-                    detection.keyword,
+                    "ESP executed %s (score=%.3f)",
                     detection.actionLabel,
                     detection.score
             );
-            mainHandler.post(() -> {
-                lastDetectionTextView.setText(message);
-                updateStatus(message);
-            });
+            lastDetectionTextView.setText(message);
+            updateStatus(message);
+        } else {
+            String message = String.format(
+                    Locale.US,
+                    "ESP executed %s",
+                    fallbackPrediction.label.toUpperCase(Locale.US)
+            );
+            lastDetectionTextView.setText(message);
+            updateStatus(message);
         }
     }
 

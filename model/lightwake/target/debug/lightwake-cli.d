@@ -1,1 +1,0 @@
-F:\Code\NCKH_EE_2026\model\lightwake\target\debug\lightwake-cli.exe: F:\Code\NCKH_EE_2026\model\lightwake\src\ffmpeg_normalize.rs F:\Code\NCKH_EE_2026\model\lightwake\src\lib.rs F:\Code\NCKH_EE_2026\model\lightwake\src\main.rs

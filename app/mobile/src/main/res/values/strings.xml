@@ -14,11 +14,11 @@
     <string name="note_label">Optional note</string>
     <string name="note_hint">Short note for this recording</string>
     <string name="status_idle">Idle</string>
-    <string name="last_detection_empty">No ESP detection yet</string>
+    <string name="last_detection_empty">No ESP command yet</string>
     <string name="start_recording">Start recording</string>
     <string name="stop_recording">Stop and upload</string>
-    <string name="start_listening">Start listening</string>
-    <string name="stop_listening">Stop listening</string>
+    <string name="start_listening">Start command listen</string>
+    <string name="stop_listening">Stop command listen</string>
     <string name="retry_upload">Retry last upload</string>
     <string name="refresh_list">Refresh list</string>
     <string name="check_esp_connection">Check ESP</string>

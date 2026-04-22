@@ -12,5 +12,5 @@ idf_component_register(
         esp_wifi
         nvs_flash
         lwip
-        rust_bridge
+        driver
 )

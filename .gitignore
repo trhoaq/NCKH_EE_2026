@@ -1,4 +1,7 @@
 .omx/
+.gradle-user/
+gradle-user-home/
+venv/
 backend/node_modules/
 backend/storage/
 app/.gradle/
@@ -15,7 +18,8 @@ app_test/.idea/
 model/lightwake/.work/
 model/data/
 app_test/
+firmware/rust/wakeword_bridge/target/
 firmware/build
 .codex/
 .vscode/
-model/lightwake/target
+model/lightwake/target/

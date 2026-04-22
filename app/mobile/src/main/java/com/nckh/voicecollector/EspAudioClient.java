@@ -23,6 +23,7 @@ public class EspAudioClient implements Closeable {
     private static final short TYPE_STATE = 5;
     private static final short TYPE_DETECTION = 6;
     private static final short TYPE_ERROR = 7;
+    private static final short TYPE_COMMAND = 8;
 
     private static final int CONNECT_TIMEOUT_MS = 5000;
     private static final int SO_TIMEOUT_MS = 300;
@@ -91,6 +92,22 @@ public class EspAudioClient implements Closeable {
         writeHeader(TYPE_SESSION_END, 8);
         outputStream.writeInt(sessionId);
         outputStream.writeInt(totalFrames);
+        outputStream.flush();
+    }
+
+    public void sendCommand(int requestId, int actionId, String keyword, float confidence) throws IOException {
+        byte[] keywordBytes = keyword == null
+                ? new byte[0]
+                : keyword.getBytes(StandardCharsets.UTF_8);
+        int payloadLength = 12 + keywordBytes.length;
+        writeHeader(TYPE_COMMAND, payloadLength);
+        outputStream.writeInt(requestId);
+        outputStream.writeShort(actionId);
+        outputStream.writeShort(keywordBytes.length);
+        outputStream.writeInt(Math.max(0, Math.min(1000, Math.round(confidence * 1000f))));
+        if (keywordBytes.length > 0) {
+            outputStream.write(keywordBytes);
+        }
         outputStream.flush();
     }
 

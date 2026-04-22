@@ -1,3 +1,0 @@
-cargo:rerun-if-changed=F:\Code\NCKH_EE_2026\firmware\rust\wakeword_bridge\../../../model/wakewords.manifest
-cargo:rerun-if-changed=F:\Code\NCKH_EE_2026\firmware\rust\wakeword_bridge\../../../model\lightwake/voice_commands.lww
-cargo:warning=lightwake model file missing and detector will boot in not-ready mode: F:\Code\NCKH_EE_2026\firmware\rust\wakeword_bridge\../../../model\lightwake/voice_commands.lww
