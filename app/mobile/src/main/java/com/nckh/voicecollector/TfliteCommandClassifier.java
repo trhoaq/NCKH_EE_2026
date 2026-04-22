@@ -28,6 +28,7 @@ public final class TfliteCommandClassifier implements AutoCloseable {
     private final int targetFrames;
     private final int streamHopSamples;
     private final float threshold;
+    private final float marginThreshold;
     private final int smoothingWindows;
     private final int cooldownMs;
     private final String[] labels;
@@ -47,6 +48,7 @@ public final class TfliteCommandClassifier implements AutoCloseable {
             int targetFrames,
             int streamHopSamples,
             float threshold,
+            float marginThreshold,
             int smoothingWindows,
             int cooldownMs,
             String[] labels,
@@ -63,6 +65,7 @@ public final class TfliteCommandClassifier implements AutoCloseable {
         this.targetFrames = targetFrames;
         this.streamHopSamples = streamHopSamples;
         this.threshold = threshold;
+        this.marginThreshold = marginThreshold;
         this.smoothingWindows = smoothingWindows;
         this.cooldownMs = cooldownMs;
         this.labels = labels;
@@ -99,6 +102,7 @@ public final class TfliteCommandClassifier implements AutoCloseable {
                     root.getInt("target_frames"),
                     root.optInt("stream_hop_samples", root.getInt("frame_hop") * 25),
                     (float) root.getDouble("threshold"),
+                    (float) root.optDouble("margin_threshold", 0.12),
                     root.getInt("smoothing_windows"),
                     root.getInt("cooldown_ms"),
                     readStringArray(root.getJSONArray("labels")),
@@ -143,6 +147,15 @@ public final class TfliteCommandClassifier implements AutoCloseable {
                 bestIndex = index;
             }
         }
+        int secondIndex = bestIndex == 0 ? 1 : 0;
+        for (int index = 0; index < probabilities.length; index++) {
+            if (index == bestIndex) {
+                continue;
+            }
+            if (probabilities[index] > probabilities[secondIndex]) {
+                secondIndex = index;
+            }
+        }
 
         String label = labels[bestIndex];
         int actionId;
@@ -153,7 +166,15 @@ public final class TfliteCommandClassifier implements AutoCloseable {
         } else {
             actionId = ACTION_NONE;
         }
-        return new Prediction(actionId, label, probabilities[bestIndex], probabilities);
+        return new Prediction(
+                actionId,
+                label,
+                probabilities[bestIndex],
+                labels[secondIndex],
+                probabilities[secondIndex],
+                probabilities[bestIndex] - probabilities[secondIndex],
+                probabilities
+        );
     }
 
     public int getSampleRate() {
@@ -174,6 +195,10 @@ public final class TfliteCommandClassifier implements AutoCloseable {
 
     public int getSmoothingWindows() {
         return smoothingWindows;
+    }
+
+    public float getMarginThreshold() {
+        return marginThreshold;
     }
 
     public int getCooldownMs() {
@@ -482,12 +507,26 @@ public final class TfliteCommandClassifier implements AutoCloseable {
         public final int actionId;
         public final String label;
         public final float confidence;
+        public final String secondLabel;
+        public final float secondConfidence;
+        public final float margin;
         public final float[] probabilities;
 
-        Prediction(int actionId, String label, float confidence, float[] probabilities) {
+        Prediction(
+                int actionId,
+                String label,
+                float confidence,
+                String secondLabel,
+                float secondConfidence,
+                float margin,
+                float[] probabilities
+        ) {
             this.actionId = actionId;
             this.label = label;
             this.confidence = confidence;
+            this.secondLabel = secondLabel;
+            this.secondConfidence = secondConfidence;
+            this.margin = margin;
             this.probabilities = probabilities;
         }
     }

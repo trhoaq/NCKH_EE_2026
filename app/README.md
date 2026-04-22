@@ -25,4 +25,4 @@ Native Android Java client with two transport modes:
 - The ESP no longer runs wakeword or command inference; it only validates incoming commands and applies control logic.
 - The active command model pair is:
   - `app/mobile/src/main/assets/command_model.tflite`
-  - `app/mobile/src/main/assets/command_model_meta.json`
+  - `app/mobile/src/main/assets/command_model.json`

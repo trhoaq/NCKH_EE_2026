@@ -47,7 +47,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String DEFAULT_ESP_HOST = "192.168.4.1";
     private static final String DEFAULT_ESP_PORT = "3333";
     private static final String COMMAND_MODEL_ASSET = "command_model.tflite";
-    private static final String COMMAND_MODEL_META_ASSET = "command_model_meta.json";
+    private static final String COMMAND_MODEL_META_ASSET = "command_model.json";
 
     private final VoiceBackendClient backendClient = new VoiceBackendClient();
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
@@ -64,6 +64,7 @@ public class MainActivity extends AppCompatActivity {
     private EditText noteEditText;
     private TextView statusTextView;
     private TextView lastDetectionTextView;
+    private TextView debugPredictionTextView;
     private Button startButton;
     private Button stopButton;
     private Button retryUploadButton;
@@ -144,6 +145,7 @@ public class MainActivity extends AppCompatActivity {
         noteEditText = findViewById(R.id.noteEditText);
         statusTextView = findViewById(R.id.statusTextView);
         lastDetectionTextView = findViewById(R.id.lastDetectionTextView);
+        debugPredictionTextView = findViewById(R.id.debugPredictionTextView);
         startButton = findViewById(R.id.startRecordingButton);
         stopButton = findViewById(R.id.stopRecordingButton);
         retryUploadButton = findViewById(R.id.retryUploadButton);
@@ -172,12 +174,14 @@ public class MainActivity extends AppCompatActivity {
         noteSection.setVisibility(espMode ? View.GONE : View.VISIBLE);
         sharedRecordingsSection.setVisibility(espMode ? View.GONE : View.VISIBLE);
         lastDetectionTextView.setVisibility(espMode ? View.VISIBLE : View.GONE);
+        debugPredictionTextView.setVisibility(espMode ? View.VISIBLE : View.GONE);
         retryUploadButton.setVisibility(espMode ? View.GONE : View.VISIBLE);
         refreshButton.setText(espMode ? R.string.check_esp_connection : R.string.refresh_list);
         startButton.setText(espMode ? R.string.start_listening : R.string.start_recording);
         stopButton.setText(espMode ? R.string.stop_listening : R.string.stop_recording);
         if (espMode) {
             recordingAdapter.submitList(Collections.emptyList());
+            debugPredictionTextView.setText(getString(R.string.debug_prediction_empty));
             updateStatus("ESP command mode ready");
         } else {
             updateStatus("Backend mode ready");
@@ -349,6 +353,7 @@ public class MainActivity extends AppCompatActivity {
                 activeEspClient = client;
                 mainHandler.post(() -> {
                     lastDetectionTextView.setText(getString(R.string.last_detection_empty));
+                    debugPredictionTextView.setText(getString(R.string.debug_prediction_empty));
                     updateStatus("ESP connected. Starting DL recognizer...");
                     startCommandRecognizer();
                 });
@@ -378,6 +383,11 @@ public class MainActivity extends AppCompatActivity {
                     @Override
                     public void onCommandDetected(TfliteCommandClassifier.Prediction prediction) {
                         mainHandler.post(() -> handleDetectedCommand(prediction));
+                    }
+
+                    @Override
+                    public void onDebugPrediction(TfliteCommandClassifier.Prediction prediction) {
+                        mainHandler.post(() -> updateDebugPrediction(prediction));
                     }
 
                     @Override
@@ -416,13 +426,37 @@ public class MainActivity extends AppCompatActivity {
         }
         String pendingMessage = String.format(
                 Locale.US,
-                "Detected \"%s\" (%.3f)",
+                "Detected \"%s\" (p=%.3f, margin=%.3f)",
                 prediction.label,
-                prediction.confidence
+                prediction.confidence,
+                prediction.margin
         );
         lastDetectionTextView.setText(pendingMessage);
         updateStatus("Sending command to ESP...");
         dispatchEspCommand(prediction);
+    }
+
+    private void updateDebugPrediction(TfliteCommandClassifier.Prediction prediction) {
+        if (!isRecording) {
+            return;
+        }
+        String routedLabel = "unknown";
+        if (prediction.actionId == 1) {
+            routedLabel = "on";
+        } else if (prediction.actionId == 2) {
+            routedLabel = "off";
+        }
+        String debugLine = String.format(
+                Locale.US,
+                "Debug: raw=%s p=%.3f second=%s p2=%.3f margin=%.3f routed=%s",
+                prediction.label,
+                prediction.confidence,
+                prediction.secondLabel,
+                prediction.secondConfidence,
+                prediction.margin,
+                routedLabel
+        );
+        debugPredictionTextView.setText(debugLine);
     }
 
     private void stopEspListening() {

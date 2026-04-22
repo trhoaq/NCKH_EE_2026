@@ -1,10 +1,19 @@
 import argparse
+import importlib.util
 import json
 import math
+import time
 import wave
 from pathlib import Path
 
 import numpy as np
+
+if not importlib.util.find_spec("tensorflow"):
+    raise SystemExit(
+        "tensorflow is required for TFLite inference. Install TensorFlow in your Python environment first."
+    )
+
+import tensorflow as tf
 
 
 def read_wav_mono(path: Path):
@@ -21,6 +30,8 @@ def read_wav_mono(path: Path):
     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
     if channels == 2:
         samples = samples.reshape(-1, 2).mean(axis=1)
+    elif channels != 1:
+        raise ValueError("Only mono or stereo WAV is supported")
     return samples, sample_rate
 
 
@@ -36,166 +47,150 @@ def resample_linear(samples, input_rate, output_rate):
     return (samples[left] * (1.0 - alpha) + samples[right] * alpha).astype(np.float32)
 
 
-def trim_and_window(samples, sample_rate, window_samples):
-    samples = resample_linear(samples, sample_rate, 16000)
+def normalize_amplitude(samples):
     peak = np.max(np.abs(samples)) if samples.size else 0.0
-    if peak > 1e-5:
-        samples = samples / peak
+    if peak < 1e-5:
+        return samples.astype(np.float32, copy=False)
+    return (samples / peak).astype(np.float32)
+
+
+def trim_silence(samples, frame_size, frame_hop):
+    if samples.size <= frame_size:
+        return samples
+    frame_count = 1 + max(0, (samples.shape[0] - frame_size) // frame_hop)
+    rms = []
+    for index in range(frame_count):
+        start = index * frame_hop
+        frame = samples[start:start + frame_size]
+        rms.append(float(np.sqrt(np.mean(frame * frame) + 1e-8)))
+    rms = np.array(rms, dtype=np.float32)
+    threshold = max(float(rms.max()) * 0.12, 0.01)
+    active = np.where(rms >= threshold)[0]
+    if active.size == 0:
+        return samples
+    start_frame = max(0, int(active[0]) - 2)
+    end_frame = min(frame_count - 1, int(active[-1]) + 2)
+    start = start_frame * frame_hop
+    end = min(samples.shape[0], end_frame * frame_hop + frame_size)
+    return samples[start:end]
+
+
+def fit_to_window(samples, window_samples):
     if samples.shape[0] >= window_samples:
         center = samples.shape[0] // 2
         half = window_samples // 2
         start = max(0, center - half)
         end = min(samples.shape[0], start + window_samples)
         start = end - window_samples
-        return samples[start:end]
+        return samples[start:end].astype(np.float32)
     output = np.zeros(window_samples, dtype=np.float32)
     offset = (window_samples - samples.shape[0]) // 2
     output[offset:offset + samples.shape[0]] = samples
     return output
 
 
-def hz_to_mel(hz):
-    return 2595.0 * math.log10(1.0 + hz / 700.0)
+def preprocess(samples, sample_rate, meta):
+    samples = resample_linear(samples, sample_rate, meta["sample_rate"])
+    samples = normalize_amplitude(samples)
+    samples = trim_silence(samples, meta["frame_size"], meta["frame_hop"])
+    samples = fit_to_window(samples, meta["window_samples"])
+    return samples
 
 
-def mel_to_hz(mel):
-    return 700.0 * (10 ** (mel / 2595.0) - 1.0)
+def compute_log_mel(samples, meta):
+    stft = tf.signal.stft(
+        tf.convert_to_tensor(samples, dtype=tf.float32),
+        frame_length=meta["frame_size"],
+        frame_step=meta["frame_hop"],
+        fft_length=meta["fft_size"],
+        window_fn=tf.signal.hann_window,
+        pad_end=False,
+    )
+    power = tf.abs(stft) ** 2
+    mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=meta["mel_bins"],
+        num_spectrogram_bins=(meta["fft_size"] // 2) + 1,
+        sample_rate=meta["sample_rate"],
+        lower_edge_hertz=20.0,
+        upper_edge_hertz=meta["sample_rate"] / 2.0,
+    )
+    mel = tf.matmul(power, mel_matrix)
+    log_mel = tf.math.log(mel + 1e-5)
+    log_mel = tf.image.resize(
+        log_mel[..., tf.newaxis],
+        [meta["target_frames"], meta["mel_bins"]],
+    ).numpy().astype(np.float32)
 
-
-def build_mel_bank(fft_size, mel_bins):
-    min_mel = hz_to_mel(20.0)
-    max_mel = hz_to_mel(8000.0)
-    mel_points = np.linspace(min_mel, max_mel, mel_bins + 2, dtype=np.float32)
-    hz_points = np.array([mel_to_hz(value) for value in mel_points], dtype=np.float32)
-    bins = np.floor((fft_size // 2 + 1) * hz_points / 8000.0).astype(np.int32)
-    bins = np.clip(bins, 0, fft_size // 2)
-    bank = np.zeros((mel_bins, fft_size // 2 + 1), dtype=np.float32)
-    for mel_index in range(mel_bins):
-        left = bins[mel_index]
-        center = max(left + 1, bins[mel_index + 1])
-        right = max(center + 1, bins[mel_index + 2])
-        for bin_index in range(left, min(center, bank.shape[1])):
-            bank[mel_index, bin_index] = (bin_index - left) / max(1, center - left)
-        for bin_index in range(center, min(right, bank.shape[1])):
-            bank[mel_index, bin_index] = (right - bin_index) / max(1, right - center)
-    return bank
-
-
-def log_mel(samples, frame_size, frame_hop, fft_size, mel_bins, target_frames):
-    window = np.hanning(frame_size).astype(np.float32)
-    frame_count = 1 + max(0, (samples.shape[0] - frame_size) // frame_hop)
-    bank = build_mel_bank(fft_size, mel_bins)
-    frames = []
-    for index in range(frame_count):
-        start = index * frame_hop
-        frame = np.zeros(fft_size, dtype=np.float32)
-        frame[:frame_size] = samples[start:start + frame_size] * window
-        spectrum = np.fft.rfft(frame)
-        power = np.abs(spectrum) ** 2
-        mel = bank @ power
-        frames.append(np.log(mel + 1e-5))
-    features = np.stack(frames, axis=0).astype(np.float32)
-    positions = np.linspace(0, features.shape[0] - 1, target_frames, dtype=np.float32)
-    left = np.floor(positions).astype(np.int32)
-    right = np.minimum(left + 1, features.shape[0] - 1)
-    alpha = (positions - left).reshape(-1, 1)
-    return features[left] * (1.0 - alpha) + features[right] * alpha
-
-
-def relu(values):
-    return np.maximum(values, 0.0)
-
-
-def softmax(values):
-    shifted = values - np.max(values)
-    exps = np.exp(shifted)
-    return exps / np.sum(exps)
-
-
-def conv2d_single_channel(inputs, weights, bias, padding_h, padding_w):
-    time_steps, mel_bins = inputs.shape
-    out_channels = len(weights)
-    kernel_h = len(weights[0][0])
-    kernel_w = len(weights[0][0][0])
-    outputs = np.zeros((out_channels, time_steps, mel_bins), dtype=np.float32)
-    for out_channel in range(out_channels):
-        for time_index in range(time_steps):
-            for mel_index in range(mel_bins):
-                acc = bias[out_channel]
-                for kernel_time in range(kernel_h):
-                    for kernel_mel in range(kernel_w):
-                        source_time = time_index + kernel_time - padding_h
-                        source_mel = mel_index + kernel_mel - padding_w
-                        if 0 <= source_time < time_steps and 0 <= source_mel < mel_bins:
-                            acc += weights[out_channel][0][kernel_time][kernel_mel] * inputs[source_time][source_mel]
-                outputs[out_channel][time_index][mel_index] = acc
-    return outputs
-
-
-def conv1d(inputs, weights, bias, padding):
-    in_channels, time_steps = inputs.shape
-    out_channels = len(weights)
-    kernel_size = len(weights[0][0])
-    outputs = np.zeros((out_channels, time_steps), dtype=np.float32)
-    for out_channel in range(out_channels):
-        for time_index in range(time_steps):
-            acc = bias[out_channel]
-            for in_channel in range(in_channels):
-                for kernel_index in range(kernel_size):
-                    source_time = time_index + kernel_index - padding
-                    if 0 <= source_time < time_steps:
-                        acc += weights[out_channel][in_channel][kernel_index] * inputs[in_channel][source_time]
-            outputs[out_channel][time_index] = acc
-    return outputs
+    mean = np.array(meta["feature_mean"], dtype=np.float32).reshape(1, meta["mel_bins"], 1)
+    std = np.array(meta["feature_std"], dtype=np.float32).reshape(1, meta["mel_bins"], 1)
+    return (log_mel - mean) / std
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-json", required=True)
+    parser.add_argument("--model-tflite", required=True)
+    parser.add_argument("--model-meta", required=True)
     parser.add_argument("--wav", required=True)
     args = parser.parse_args()
 
-    payload = json.loads(Path(args.model_json).read_text(encoding="utf-8"))
+    meta = json.loads(Path(args.model_meta).read_text(encoding="utf-8"))
+
+    preprocess_started_at = time.perf_counter()
     samples, sample_rate = read_wav_mono(Path(args.wav))
-    samples = trim_and_window(samples, sample_rate, payload["window_samples"])
-    features = log_mel(
-        samples,
-        payload["frame_size"],
-        payload["frame_hop"],
-        payload["fft_size"],
-        payload["mel_bins"],
-        payload["target_frames"],
-    )
-    mean = np.array(payload["feature_mean"], dtype=np.float32)
-    std = np.array(payload["feature_std"], dtype=np.float32)
-    features = (features - mean.reshape(1, -1)) / std.reshape(1, -1)
+    samples = preprocess(samples, sample_rate, meta)
+    features = compute_log_mel(samples, meta)
+    inputs = features[np.newaxis, ...]
+    preprocess_ms = (time.perf_counter() - preprocess_started_at) * 1000.0
 
-    conv = payload["conv2d"]
-    temporal = payload["temporal_conv"]
-    fc = payload["fc"]
+    interpreter = tf.lite.Interpreter(model_path=args.model_tflite)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    interpreter.set_tensor(input_details[0]["index"], inputs)
+    inference_started_at = time.perf_counter()
+    interpreter.invoke()
+    inference_ms = (time.perf_counter() - inference_started_at) * 1000.0
+    probabilities = interpreter.get_tensor(output_details[0]["index"])[0]
+    total_ms = preprocess_ms + inference_ms
 
-    hidden = relu(
-        conv2d_single_channel(
-            features,
-            conv["weights"],
-            conv["bias"],
-            conv["padding_h"],
-            conv["padding_w"],
+    best_index = int(np.argmax(probabilities))
+    second_index = 0 if best_index != 0 else 1
+    for index in range(len(probabilities)):
+        if index == best_index:
+            continue
+        if probabilities[index] > probabilities[second_index]:
+            second_index = index
+    label = meta["labels"][best_index]
+    confidence = float(probabilities[best_index])
+    second_label = meta["labels"][second_index]
+    second_confidence = float(probabilities[second_index])
+    margin = confidence - second_confidence
+    threshold = float(meta.get("threshold", 0.75))
+    margin_threshold = float(meta.get("margin_threshold", 0.12))
+    routed_label = label
+    if label in ("on", "off"):
+        if confidence < threshold or margin < margin_threshold:
+            routed_label = "unknown"
+    print(
+        json.dumps(
+            {
+                "label": label,
+                "confidence": confidence,
+                "second_label": second_label,
+                "second_confidence": second_confidence,
+                "margin": margin,
+                "routed_label": routed_label,
+                "preprocess_ms": preprocess_ms,
+                "inference_ms": inference_ms,
+                "total_ms": total_ms,
+                "probabilities": {
+                    class_label: float(probabilities[index])
+                    for index, class_label in enumerate(meta["labels"])
+                },
+            },
+            indent=2,
         )
     )
-    hidden = hidden.mean(axis=2)
-    hidden = relu(conv1d(hidden, temporal["weights"], temporal["bias"], temporal["padding"]))
-    pooled = hidden.mean(axis=1)
-    logits = np.dot(np.array(fc["weights"], dtype=np.float32), pooled) + np.array(fc["bias"], dtype=np.float32)
-    probabilities = softmax(logits)
-    best_index = int(np.argmax(probabilities))
-    print(json.dumps({
-        "label": payload["labels"][best_index],
-        "confidence": float(probabilities[best_index]),
-        "probabilities": {
-            label: float(probabilities[index]) for index, label in enumerate(payload["labels"])
-        },
-    }, indent=2))
 
 
 if __name__ == "__main__":

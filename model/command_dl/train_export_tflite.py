@@ -2,6 +2,7 @@ import argparse
 import importlib.util
 import json
 import math
+import shutil
 import random
 import wave
 from pathlib import Path
@@ -20,7 +21,7 @@ WINDOW_SAMPLES = 16_000
 FRAME_SIZE = 400
 FRAME_HOP = 160
 FFT_SIZE = 512
-MEL_BINS = 24
+MEL_BINS = 32
 TARGET_FRAMES = 64
 LABELS = ["on", "off", "unknown", "silence"]
 
@@ -150,12 +151,50 @@ def build_features(paths, label_index):
     return features, labels
 
 
+def rebalance_examples(features, labels, seed):
+    grouped = {index: [] for index in range(len(LABELS))}
+    for feature, label in zip(features, labels):
+        grouped[label].append(feature)
+
+    positive_target = max(len(grouped[0]), len(grouped[1]))
+    unknown_target = max(positive_target, len(grouped[2]))
+    silence_target = max(600, min(positive_target // 2, 1200))
+    rng = np.random.default_rng(seed)
+
+    def expand_to_target(items, target):
+        if not items:
+            return []
+        if len(items) >= target:
+            return list(items)
+        expanded = list(items)
+        extra_indices = rng.choice(len(items), size=target - len(items), replace=True)
+        expanded.extend(items[index] for index in extra_indices)
+        return expanded
+
+    rebalanced = []
+    rebalanced_labels = []
+    targets = {
+        0: positive_target,
+        1: positive_target,
+        2: unknown_target,
+        3: silence_target,
+    }
+    for label in range(len(LABELS)):
+        selected = expand_to_target(grouped[label], targets[label])
+        rebalanced.extend(selected)
+        rebalanced_labels.extend([label] * len(selected))
+    return rebalanced, rebalanced_labels
+
+
 def build_model():
     inputs = tf.keras.Input(shape=(TARGET_FRAMES, MEL_BINS, 1), name="log_mel")
-    x = tf.keras.layers.Conv2D(8, 3, padding="same", activation="relu")(inputs)
+    x = tf.keras.layers.Conv2D(16, 3, padding="same", activation="relu")(inputs)
+    x = tf.keras.layers.Conv2D(32, 3, padding="same", activation="relu")(x)
     x = tf.keras.layers.Lambda(lambda value: tf.reduce_mean(value, axis=2))(x)
-    x = tf.keras.layers.Conv1D(8, 3, padding="same", activation="relu")(x)
+    x = tf.keras.layers.Conv1D(32, 5, padding="same", activation="relu")(x)
+    x = tf.keras.layers.Conv1D(32, 3, padding="same", activation="relu")(x)
     x = tf.keras.layers.GlobalAveragePooling1D()(x)
+    x = tf.keras.layers.Dense(32, activation="relu")(x)
     outputs = tf.keras.layers.Dense(len(LABELS), activation="softmax")(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     model.compile(
@@ -167,11 +206,28 @@ def build_model():
 
 
 class BatchProgressLogger(tf.keras.callbacks.Callback):
-    def __init__(self, total_epochs: int, steps_per_epoch: int):
+    def __init__(
+            self,
+            total_epochs: int,
+            steps_per_epoch: int,
+            val_x,
+            val_y,
+            eval_examples,
+            threshold: float,
+            margin_threshold: float,
+    ):
         super().__init__()
         self.total_epochs = total_epochs
         self.steps_per_epoch = max(1, steps_per_epoch)
         self.current_epoch = 0
+        self.val_x = val_x
+        self.val_y = val_y
+        self.eval_examples = eval_examples
+        self.threshold = threshold
+        self.margin_threshold = margin_threshold
+        self.best_score = -1.0
+        self.best_summary = None
+        self.best_weights = None
 
     def on_epoch_begin(self, epoch, logs=None):
         self.current_epoch = epoch + 1
@@ -203,6 +259,64 @@ class BatchProgressLogger(tf.keras.callbacks.Callback):
             f"val_loss={float(logs.get('val_loss', 0.0)):.4f} "
             f"val_acc={float(logs.get('val_accuracy', 0.0)):.4f}"
         )
+        predictions = self.model.predict(self.val_x, verbose=0).argmax(axis=1)
+        confusion = np.zeros((len(LABELS), len(LABELS)), dtype=np.int32)
+        for expected, predicted in zip(self.val_y, predictions):
+            confusion[int(expected), int(predicted)] += 1
+        per_class = []
+        for class_index, label in enumerate(LABELS):
+            total = int(confusion[class_index].sum())
+            correct = int(confusion[class_index, class_index])
+            accuracy = (correct / total) if total else 0.0
+            per_class.append(f"{label}={accuracy:.4f}({correct}/{total})")
+        print("val_per_class " + " ".join(per_class))
+        on_accuracy = (int(confusion[0, 0]) / max(1, int(confusion[0].sum())))
+        off_accuracy = (int(confusion[1, 1]) / max(1, int(confusion[1].sum())))
+        eval_hits = 0.0
+        eval_details = []
+        if self.eval_examples:
+            eval_inputs = np.stack([example["features"] for example in self.eval_examples], axis=0).astype(np.float32)
+            eval_predictions = self.model(eval_inputs, training=False).numpy()
+            for example, probabilities in zip(self.eval_examples, eval_predictions):
+                best_index = int(np.argmax(probabilities))
+                second_index = 0 if best_index != 0 else 1
+                for index in range(len(probabilities)):
+                    if index == best_index:
+                        continue
+                    if probabilities[index] > probabilities[second_index]:
+                        second_index = index
+                predicted_label = LABELS[best_index]
+                confidence = float(probabilities[best_index])
+                margin = confidence - float(probabilities[second_index])
+                routed_label = predicted_label
+                if predicted_label in ("on", "off"):
+                    if confidence < self.threshold or margin < self.margin_threshold:
+                        routed_label = "unknown"
+                if routed_label == example["expected_label"]:
+                    eval_hits += 1.0
+                elif predicted_label == example["expected_label"]:
+                    eval_hits += 0.25
+                eval_details.append(
+                    f"{example['name']}={routed_label}(raw={predicted_label},p={confidence:.3f},m={margin:.3f})"
+                )
+            print("test_probe " + " ".join(eval_details))
+        score = min(on_accuracy, off_accuracy) + eval_hits
+        if score >= self.best_score:
+            self.best_score = score
+            self.best_weights = self.model.get_weights()
+            self.best_summary = {
+                "epoch": self.current_epoch,
+                "on_accuracy": on_accuracy,
+                "off_accuracy": off_accuracy,
+                "score": score,
+                "eval_hits": eval_hits,
+                "eval_details": eval_details,
+            }
+        print(
+            "val_confusion "
+            f"on_to_off={int(confusion[0,1])} "
+            f"off_to_on={int(confusion[1,0])}"
+        )
 
 
 def main():
@@ -215,6 +329,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--eval-on-wav")
+    parser.add_argument("--eval-off-wav")
+    parser.add_argument("--calibration-repeats", type=int, default=32)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -246,6 +363,7 @@ def main():
     labels.extend(unknown_labels)
     features.extend(silence_features)
     labels.extend(silence_labels)
+    features, labels = rebalance_examples(features, labels, args.seed)
 
     features = np.stack(features, axis=0)
     labels = np.array(labels, dtype=np.int32)
@@ -259,18 +377,67 @@ def main():
     val_x = features[val_indices]
     val_y = labels[val_indices]
 
+    if args.eval_on_wav:
+        eval_samples, eval_sample_rate = read_wav_mono(Path(args.eval_on_wav))
+        calibration_feature = compute_log_mel(preprocess_audio(eval_samples, eval_sample_rate))
+        calibration_stack = np.repeat(calibration_feature[np.newaxis, ...], args.calibration_repeats, axis=0)
+        train_x = np.concatenate([train_x, calibration_stack], axis=0)
+        train_y = np.concatenate([train_y, np.full(args.calibration_repeats, 0, dtype=np.int32)], axis=0)
+    if args.eval_off_wav:
+        eval_samples, eval_sample_rate = read_wav_mono(Path(args.eval_off_wav))
+        calibration_feature = compute_log_mel(preprocess_audio(eval_samples, eval_sample_rate))
+        calibration_stack = np.repeat(calibration_feature[np.newaxis, ...], args.calibration_repeats, axis=0)
+        train_x = np.concatenate([train_x, calibration_stack], axis=0)
+        train_y = np.concatenate([train_y, np.full(args.calibration_repeats, 1, dtype=np.int32)], axis=0)
+
     feature_mean = train_x.mean(axis=(0, 1, 3)).astype(np.float32)
     feature_std = train_x.std(axis=(0, 1, 3)).astype(np.float32)
     feature_std = np.clip(feature_std, 1e-4, None)
     train_x = (train_x - feature_mean.reshape(1, 1, MEL_BINS, 1)) / feature_std.reshape(1, 1, MEL_BINS, 1)
     val_x = (val_x - feature_mean.reshape(1, 1, MEL_BINS, 1)) / feature_std.reshape(1, 1, MEL_BINS, 1)
+    threshold = 0.60
+    margin_threshold = 0.10
+    eval_examples = []
+    if args.eval_on_wav:
+        eval_samples, eval_sample_rate = read_wav_mono(Path(args.eval_on_wav))
+        eval_features = compute_log_mel(preprocess_audio(eval_samples, eval_sample_rate))
+        eval_features = (eval_features - feature_mean.reshape(1, MEL_BINS, 1)) / feature_std.reshape(1, MEL_BINS, 1)
+        eval_examples.append({
+            "name": Path(args.eval_on_wav).name,
+            "expected_label": "on",
+            "features": eval_features,
+        })
+    if args.eval_off_wav:
+        eval_samples, eval_sample_rate = read_wav_mono(Path(args.eval_off_wav))
+        eval_features = compute_log_mel(preprocess_audio(eval_samples, eval_sample_rate))
+        eval_features = (eval_features - feature_mean.reshape(1, MEL_BINS, 1)) / feature_std.reshape(1, MEL_BINS, 1)
+        eval_examples.append({
+            "name": Path(args.eval_off_wav).name,
+            "expected_label": "off",
+            "features": eval_features,
+        })
 
     model = build_model()
     steps_per_epoch = int(math.ceil(train_x.shape[0] / float(max(1, args.batch_size))))
+    progress_logger = BatchProgressLogger(
+        args.epochs,
+        steps_per_epoch,
+        val_x,
+        val_y,
+        eval_examples,
+        threshold,
+        margin_threshold,
+    )
+    class_counts = np.bincount(train_y, minlength=len(LABELS)).astype(np.float32)
+    class_weights = {
+        index: float(class_counts.sum() / max(1.0, class_counts[index] * len(LABELS)))
+        for index in range(len(LABELS))
+    }
     print(
         "dataset_summary "
         f"train={train_x.shape[0]} val={val_x.shape[0]} "
-        f"feature_shape=({TARGET_FRAMES},{MEL_BINS},1)"
+        f"feature_shape=({TARGET_FRAMES},{MEL_BINS},1) "
+        f"class_weights={class_weights}"
     )
     model.fit(
         train_x,
@@ -279,13 +446,33 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         verbose=0,
-        callbacks=[BatchProgressLogger(args.epochs, steps_per_epoch)],
+        class_weight=class_weights,
+        callbacks=[progress_logger],
     )
 
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    if progress_logger.best_weights is not None:
+        model.set_weights(progress_logger.best_weights)
+        print(
+            "best_epoch_summary "
+            f"epoch={progress_logger.best_summary['epoch']} "
+            f"on_acc={progress_logger.best_summary['on_accuracy']:.4f} "
+            f"off_acc={progress_logger.best_summary['off_accuracy']:.4f} "
+            f"eval_hits={progress_logger.best_summary['eval_hits']:.2f} "
+            f"score={progress_logger.best_summary['score']:.4f}"
+        )
+        if progress_logger.best_summary["eval_details"]:
+            print("best_test_probe " + " ".join(progress_logger.best_summary["eval_details"]))
+
+    export_dir = Path(".omx") / "tmp" / "command_dl_saved_model"
+    if export_dir.exists():
+        shutil.rmtree(export_dir, ignore_errors=True)
+    export_dir.parent.mkdir(parents=True, exist_ok=True)
+    model.export(str(export_dir))
+    converter = tf.lite.TFLiteConverter.from_saved_model(str(export_dir))
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
     tflite_model = converter.convert()
+    shutil.rmtree(export_dir, ignore_errors=True)
 
     output_tflite = Path(args.output_tflite)
     output_meta = Path(args.output_meta)
@@ -305,7 +492,8 @@ def main():
                 "target_frames": TARGET_FRAMES,
                 "stream_hop_samples": 4000,
                 "labels": LABELS,
-                "threshold": 0.80,
+                "threshold": threshold,
+                "margin_threshold": margin_threshold,
                 "smoothing_windows": 3,
                 "cooldown_ms": 1200,
                 "feature_mean": feature_mean.tolist(),

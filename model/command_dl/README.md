@@ -16,20 +16,21 @@ The active lane uses TensorFlow Lite artifacts:
 
 ```powershell
 python .\model\command_dl\train_export_tflite.py `
-  --on-dir .\model\data\data_on\positive `
-  --off-dir .\model\data\data_off\positive `
-  --unknown-dir .\model\data\data_on\negative `
-  --unknown-dir .\model\data\data_off\negative `
+  --on-dir .\model\data\data_on `
+  --off-dir .\model\data\data_off `
+  --unknown-dir .\model\data\unknown `
   --output-tflite .\app\mobile\src\main\assets\command_model.tflite `
-  --output-meta .\app\mobile\src\main\assets\command_model_meta.json `
+  --output-meta .\app\mobile\src\main\assets\command_model.json `
   --epochs 6
 ```
 
 `tensorflow` must be installed in your Python environment for this export path.
 
-## Notes
+## Test one WAV file
 
-- `infer_wav.py` is the older JSON-weight debug lane and is no longer the active mobile runtime path.
-- The active mobile path expects:
-  - `command_model.tflite`
-  - `command_model_meta.json`
+```powershell
+python .\model\command_dl\infer_wav.py `
+  --model-tflite .\app\mobile\src\main\assets\command_model.tflite `
+  --model-meta .\app\mobile\src\main\assets\command_model.json `
+  --wav .\model\data\data_on\004ae714_nohash_0.wav
+```

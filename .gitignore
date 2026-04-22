@@ -17,9 +17,7 @@ app_test/.idea/
 *.iml
 model/lightwake/.work/
 model/data/
-app_test/
-firmware/rust/wakeword_bridge/target/
+model/test/
 firmware/build
 .codex/
 .vscode/
-model/lightwake/target/

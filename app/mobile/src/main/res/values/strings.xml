@@ -15,6 +15,7 @@
     <string name="note_hint">Short note for this recording</string>
     <string name="status_idle">Idle</string>
     <string name="last_detection_empty">No ESP command yet</string>
+    <string name="debug_prediction_empty">Debug: no prediction yet</string>
     <string name="start_recording">Start recording</string>
     <string name="stop_recording">Stop and upload</string>
     <string name="start_listening">Start command listen</string>

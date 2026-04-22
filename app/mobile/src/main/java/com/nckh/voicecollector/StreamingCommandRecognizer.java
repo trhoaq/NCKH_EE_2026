@@ -10,6 +10,7 @@ import java.util.ArrayDeque;
 public final class StreamingCommandRecognizer {
     public interface Listener {
         void onCommandDetected(TfliteCommandClassifier.Prediction prediction);
+        void onDebugPrediction(TfliteCommandClassifier.Prediction prediction);
         void onStatus(String message);
         void onError(String message);
     }
@@ -133,11 +134,15 @@ public final class StreamingCommandRecognizer {
                 }
 
                 TfliteCommandClassifier.Prediction smoothed = smoothPrediction(prediction);
+                listener.onDebugPrediction(smoothed);
                 if (smoothed.actionId == 0) {
                     continue;
                 }
                 long now = System.currentTimeMillis();
                 if (smoothed.confidence < classifier.getThreshold()) {
+                    continue;
+                }
+                if (smoothed.margin < classifier.getMarginThreshold()) {
                     continue;
                 }
                 if (now - lastTriggerAtMs < classifier.getCooldownMs()) {
@@ -177,6 +182,15 @@ public final class StreamingCommandRecognizer {
                 bestIndex = index;
             }
         }
+        int secondIndex = bestIndex == 0 ? 1 : 0;
+        for (int index = 0; index < averaged.length; index++) {
+            if (index == bestIndex) {
+                continue;
+            }
+            if (averaged[index] > averaged[secondIndex]) {
+                secondIndex = index;
+            }
+        }
         String label;
         int actionId;
         if (bestIndex == 0) {
@@ -192,7 +206,15 @@ public final class StreamingCommandRecognizer {
             label = "silence";
             actionId = 0;
         }
-        return new TfliteCommandClassifier.Prediction(actionId, label, averaged[bestIndex], averaged);
+        return new TfliteCommandClassifier.Prediction(
+                actionId,
+                label,
+                averaged[bestIndex],
+                bestIndex == secondIndex ? label : (secondIndex == 0 ? "on" : secondIndex == 1 ? "off" : secondIndex == 2 ? "unknown" : "silence"),
+                averaged[secondIndex],
+                averaged[bestIndex] - averaged[secondIndex],
+                averaged
+        );
     }
 
     private short[] extractWindow(short[] ringBuffer, int writePosition) {
