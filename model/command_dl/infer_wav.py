@@ -16,6 +16,22 @@ if not importlib.util.find_spec("tensorflow"):
 import tensorflow as tf
 
 
+def calibrate_probabilities(probabilities, meta):
+    calibrated = np.array(probabilities, dtype=np.float32, copy=True)
+    labels = meta["labels"]
+    on_score_scale = float(meta.get("on_score_scale", 1.08))
+    off_score_scale = float(meta.get("off_score_scale", 0.94))
+    for index, label in enumerate(labels):
+        if label == "on":
+            calibrated[index] *= on_score_scale
+        elif label == "off":
+            calibrated[index] *= off_score_scale
+    total = float(np.sum(calibrated))
+    if total > 1e-6:
+        calibrated /= total
+    return calibrated
+
+
 def read_wav_mono(path: Path):
     with wave.open(str(path), "rb") as wav_file:
         channels = wav_file.getnchannels()
@@ -150,7 +166,10 @@ def main():
     inference_started_at = time.perf_counter()
     interpreter.invoke()
     inference_ms = (time.perf_counter() - inference_started_at) * 1000.0
-    probabilities = interpreter.get_tensor(output_details[0]["index"])[0]
+    probabilities = calibrate_probabilities(
+        interpreter.get_tensor(output_details[0]["index"])[0],
+        meta,
+    )
     total_ms = preprocess_ms + inference_ms
 
     best_index = int(np.argmax(probabilities))
@@ -165,8 +184,13 @@ def main():
     second_label = meta["labels"][second_index]
     second_confidence = float(probabilities[second_index])
     margin = confidence - second_confidence
-    threshold = float(meta.get("threshold", 0.75))
-    margin_threshold = float(meta.get("margin_threshold", 0.12))
+    threshold = float(meta.get("on_threshold" if label == "on" else "off_threshold", meta.get("threshold", 0.75)))
+    margin_threshold = float(
+        meta.get(
+            "on_margin_threshold" if label == "on" else "off_margin_threshold",
+            meta.get("margin_threshold", 0.12),
+        )
+    )
     routed_label = label
     if label in ("on", "off"):
         if confidence < threshold or margin < margin_threshold:

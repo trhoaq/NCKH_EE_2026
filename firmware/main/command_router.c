@@ -2,49 +2,48 @@
 
 #include <stdbool.h>
 
-#include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "led_test.h"
 
 static const char *TAG = "command_router";
-static const gpio_num_t DEVICE_GPIO = GPIO_NUM_48;
 static bool s_device_enabled = false;
 
 void command_router_init(void) {
     s_device_enabled = false;
-    gpio_config_t config = {
-            .pin_bit_mask = 1ULL << DEVICE_GPIO,
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-    };
-    esp_err_t result = gpio_config(&config);
+    esp_err_t result = led_test_init();
     if (result != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO %d: %s", (int) DEVICE_GPIO, esp_err_to_name(result));
+        ESP_LOGE(TAG, "Failed to initialize RGB status LED: %s", esp_err_to_name(result));
         return;
     }
-    gpio_set_level(DEVICE_GPIO, 0);
-    ESP_LOGI(TAG, "Command router initialized, default state=OFF");
+    ESP_LOGI(TAG, "Command router initialized, default status=NO_COMMAND");
 }
 
 void command_router_apply_action(vcp_action_id_t action_id, const char *keyword) {
     switch (action_id) {
         case VCP_ACTION_TURN_ON:
             s_device_enabled = true;
-            gpio_set_level(DEVICE_GPIO, 1);
+            led_test_set_status(LED_TEST_STATUS_ON);
             ESP_LOGI(TAG, "Command \"%s\" mapped to TURN_ON, device_state=%s",
                      keyword != NULL ? keyword : "unknown",
                      s_device_enabled ? "ON" : "OFF");
             break;
         case VCP_ACTION_TURN_OFF:
             s_device_enabled = false;
-            gpio_set_level(DEVICE_GPIO, 0);
+            led_test_set_status(LED_TEST_STATUS_OFF);
             ESP_LOGI(TAG, "Command \"%s\" mapped to TURN_OFF, device_state=%s",
                      keyword != NULL ? keyword : "unknown",
                      s_device_enabled ? "ON" : "OFF");
             break;
+        case VCP_ACTION_NONE:
+            s_device_enabled = false;
+            led_test_set_status(LED_TEST_STATUS_NO_COMMAND);
+            ESP_LOGI(TAG, "Command \"%s\" mapped to NO_COMMAND, device_state=%s",
+                     keyword != NULL ? keyword : "unknown",
+                     s_device_enabled ? "ON" : "OFF");
+            break;
         default:
+            led_test_set_status(LED_TEST_STATUS_NO_COMMAND);
             ESP_LOGW(TAG, "Ignoring unknown action id=%d for keyword \"%s\"",
                      action_id,
                      keyword != NULL ? keyword : "unknown");

@@ -16,7 +16,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(result);
 
     command_router_init();
-    ESP_ERROR_CHECK(wifi_softap_start());
+    ESP_ERROR_CHECK(app_wifi_softap_start());
 
     ESP_LOGI(TAG, "Starting in command receiver mode; phone-side inference is expected");
     ESP_ERROR_CHECK(tcp_audio_server_start());

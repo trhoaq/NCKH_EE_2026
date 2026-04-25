@@ -21,3 +21,4 @@ model/test/
 firmware/build
 .codex/
 .vscode/
+build/

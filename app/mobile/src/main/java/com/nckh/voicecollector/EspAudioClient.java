@@ -1,5 +1,6 @@
 package com.nckh.voicecollector;
 
+import javax.net.SocketFactory;
 import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -30,18 +31,24 @@ public class EspAudioClient implements Closeable {
 
     private final String host;
     private final int port;
+    private final SocketFactory socketFactory;
 
     private Socket socket;
     private DataInputStream inputStream;
     private DataOutputStream outputStream;
 
     public EspAudioClient(String host, int port) {
+        this(host, port, SocketFactory.getDefault());
+    }
+
+    public EspAudioClient(String host, int port, SocketFactory socketFactory) {
         this.host = host;
         this.port = port;
+        this.socketFactory = socketFactory;
     }
 
     public ServerHello connectAndReadHello() throws IOException {
-        socket = new Socket();
+        socket = socketFactory.createSocket();
         socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
         socket.setTcpNoDelay(true);
         socket.setSoTimeout(SO_TIMEOUT_MS);

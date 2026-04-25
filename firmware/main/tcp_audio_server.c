@@ -148,7 +148,9 @@ static bool send_detection_packet(int socket_fd,
 }
 
 static bool is_supported_action(uint16_t action_id) {
-    return action_id == VCP_ACTION_TURN_ON || action_id == VCP_ACTION_TURN_OFF;
+    return action_id == VCP_ACTION_NONE
+           || action_id == VCP_ACTION_TURN_ON
+           || action_id == VCP_ACTION_TURN_OFF;
 }
 
 static bool discard_bytes(int socket_fd, uint32_t length) {

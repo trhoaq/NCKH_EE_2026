@@ -8,12 +8,6 @@ import wave
 from pathlib import Path
 
 import numpy as np
-
-if not importlib.util.find_spec("tensorflow"):
-    raise SystemExit(
-        "tensorflow is required for TFLite export. Install TensorFlow in your Python environment first."
-    )
-
 import tensorflow as tf
 
 SAMPLE_RATE = 16_000
@@ -24,6 +18,12 @@ FFT_SIZE = 512
 MEL_BINS = 32
 TARGET_FRAMES = 64
 LABELS = ["on", "off", "unknown", "silence"]
+ON_SCORE_SCALE = 1.08
+OFF_SCORE_SCALE = 0.94
+ON_CLASS_WEIGHT_SCALE = 1.15
+OFF_CLASS_WEIGHT_SCALE = 0.95
+OFF_THRESHOLD_OFFSET = 0.06
+OFF_MARGIN_THRESHOLD_OFFSET = 0.03
 
 
 def read_wav_mono(path: Path):
@@ -215,6 +215,10 @@ class BatchProgressLogger(tf.keras.callbacks.Callback):
             eval_examples,
             threshold: float,
             margin_threshold: float,
+            on_threshold: float,
+            off_threshold: float,
+            on_margin_threshold: float,
+            off_margin_threshold: float,
     ):
         super().__init__()
         self.total_epochs = total_epochs
@@ -225,6 +229,10 @@ class BatchProgressLogger(tf.keras.callbacks.Callback):
         self.eval_examples = eval_examples
         self.threshold = threshold
         self.margin_threshold = margin_threshold
+        self.on_threshold = on_threshold
+        self.off_threshold = off_threshold
+        self.on_margin_threshold = on_margin_threshold
+        self.off_margin_threshold = off_margin_threshold
         self.best_score = -1.0
         self.best_summary = None
         self.best_weights = None
@@ -290,7 +298,11 @@ class BatchProgressLogger(tf.keras.callbacks.Callback):
                 margin = confidence - float(probabilities[second_index])
                 routed_label = predicted_label
                 if predicted_label in ("on", "off"):
-                    if confidence < self.threshold or margin < self.margin_threshold:
+                    required_threshold = self.on_threshold if predicted_label == "on" else self.off_threshold
+                    required_margin = (
+                        self.on_margin_threshold if predicted_label == "on" else self.off_margin_threshold
+                    )
+                    if confidence < required_threshold or margin < required_margin:
                         routed_label = "unknown"
                 if routed_label == example["expected_label"]:
                     eval_hits += 1.0
@@ -300,7 +312,7 @@ class BatchProgressLogger(tf.keras.callbacks.Callback):
                     f"{example['name']}={routed_label}(raw={predicted_label},p={confidence:.3f},m={margin:.3f})"
                 )
             print("test_probe " + " ".join(eval_details))
-        score = min(on_accuracy, off_accuracy) + eval_hits
+        score = (on_accuracy * 1.25) + off_accuracy + eval_hits
         if score >= self.best_score:
             self.best_score = score
             self.best_weights = self.model.get_weights()
@@ -397,6 +409,10 @@ def main():
     val_x = (val_x - feature_mean.reshape(1, 1, MEL_BINS, 1)) / feature_std.reshape(1, 1, MEL_BINS, 1)
     threshold = 0.60
     margin_threshold = 0.10
+    on_threshold = threshold
+    off_threshold = threshold + OFF_THRESHOLD_OFFSET
+    on_margin_threshold = margin_threshold
+    off_margin_threshold = margin_threshold + OFF_MARGIN_THRESHOLD_OFFSET
     eval_examples = []
     if args.eval_on_wav:
         eval_samples, eval_sample_rate = read_wav_mono(Path(args.eval_on_wav))
@@ -427,12 +443,18 @@ def main():
         eval_examples,
         threshold,
         margin_threshold,
+        on_threshold,
+        off_threshold,
+        on_margin_threshold,
+        off_margin_threshold,
     )
     class_counts = np.bincount(train_y, minlength=len(LABELS)).astype(np.float32)
     class_weights = {
         index: float(class_counts.sum() / max(1.0, class_counts[index] * len(LABELS)))
         for index in range(len(LABELS))
     }
+    class_weights[0] *= ON_CLASS_WEIGHT_SCALE
+    class_weights[1] *= OFF_CLASS_WEIGHT_SCALE
     print(
         "dataset_summary "
         f"train={train_x.shape[0]} val={val_x.shape[0]} "
@@ -494,6 +516,12 @@ def main():
                 "labels": LABELS,
                 "threshold": threshold,
                 "margin_threshold": margin_threshold,
+                "on_score_scale": ON_SCORE_SCALE,
+                "off_score_scale": OFF_SCORE_SCALE,
+                "on_threshold": on_threshold,
+                "off_threshold": off_threshold,
+                "on_margin_threshold": on_margin_threshold,
+                "off_margin_threshold": off_margin_threshold,
                 "smoothing_windows": 3,
                 "cooldown_ms": 1200,
                 "feature_mean": feature_mean.tolist(),

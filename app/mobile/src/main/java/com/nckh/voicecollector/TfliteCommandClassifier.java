@@ -32,6 +32,15 @@ public final class TfliteCommandClassifier implements AutoCloseable {
     private final int smoothingWindows;
     private final int cooldownMs;
     private final String[] labels;
+    private final float onScoreScale;
+    private final float offScoreScale;
+    private final float onThreshold;
+    private final float offThreshold;
+    private final float onMarginThreshold;
+    private final float offMarginThreshold;
+    private final float commandGateMargin;
+    private final float commandGateMaxNoiseProbability;
+    private final int triggerStabilityFrames;
     private final float[] featureMean;
     private final float[] featureStd;
     private final float[][] melFilterBank;
@@ -52,6 +61,15 @@ public final class TfliteCommandClassifier implements AutoCloseable {
             int smoothingWindows,
             int cooldownMs,
             String[] labels,
+            float onScoreScale,
+            float offScoreScale,
+            float onThreshold,
+            float offThreshold,
+            float onMarginThreshold,
+            float offMarginThreshold,
+            float commandGateMargin,
+            float commandGateMaxNoiseProbability,
+            int triggerStabilityFrames,
             float[] featureMean,
             float[] featureStd,
             Interpreter interpreter
@@ -69,6 +87,15 @@ public final class TfliteCommandClassifier implements AutoCloseable {
         this.smoothingWindows = smoothingWindows;
         this.cooldownMs = cooldownMs;
         this.labels = labels;
+        this.onScoreScale = onScoreScale;
+        this.offScoreScale = offScoreScale;
+        this.onThreshold = onThreshold;
+        this.offThreshold = offThreshold;
+        this.onMarginThreshold = onMarginThreshold;
+        this.offMarginThreshold = offMarginThreshold;
+        this.commandGateMargin = commandGateMargin;
+        this.commandGateMaxNoiseProbability = commandGateMaxNoiseProbability;
+        this.triggerStabilityFrames = triggerStabilityFrames;
         this.featureMean = featureMean;
         this.featureStd = featureStd;
         this.interpreter = interpreter;
@@ -92,6 +119,8 @@ public final class TfliteCommandClassifier implements AutoCloseable {
         Interpreter interpreter = new Interpreter(modelBuffer);
 
         try {
+            float baseThreshold = (float) root.getDouble("threshold");
+            float baseMarginThreshold = (float) root.optDouble("margin_threshold", 0.12);
             return new TfliteCommandClassifier(
                     root.getInt("sample_rate"),
                     root.getInt("window_samples"),
@@ -101,11 +130,20 @@ public final class TfliteCommandClassifier implements AutoCloseable {
                     root.getInt("mel_bins"),
                     root.getInt("target_frames"),
                     root.optInt("stream_hop_samples", root.getInt("frame_hop") * 25),
-                    (float) root.getDouble("threshold"),
-                    (float) root.optDouble("margin_threshold", 0.12),
+                    baseThreshold,
+                    baseMarginThreshold,
                     root.getInt("smoothing_windows"),
                     root.getInt("cooldown_ms"),
                     readStringArray(root.getJSONArray("labels")),
+                    (float) root.optDouble("on_score_scale", 1.08),
+                    (float) root.optDouble("off_score_scale", 0.94),
+                    (float) root.optDouble("on_threshold", baseThreshold),
+                    (float) root.optDouble("off_threshold", baseThreshold + 0.06),
+                    (float) root.optDouble("on_margin_threshold", baseMarginThreshold),
+                    (float) root.optDouble("off_margin_threshold", baseMarginThreshold + 0.03),
+                    (float) root.optDouble("command_gate_margin", 0.18),
+                    (float) root.optDouble("command_gate_max_noise_probability", 0.32),
+                    root.optInt("trigger_stability_frames", 2),
                     readFloatArray(root.getJSONArray("feature_mean")),
                     readFloatArray(root.getJSONArray("feature_std")),
                     interpreter
@@ -139,7 +177,7 @@ public final class TfliteCommandClassifier implements AutoCloseable {
 
         float[][] output = new float[1][labels.length];
         interpreter.run(input, output);
-        float[] probabilities = output[0];
+        float[] probabilities = calibrateProbabilities(output[0]);
 
         int bestIndex = 0;
         for (int index = 1; index < probabilities.length; index++) {
@@ -201,13 +239,82 @@ public final class TfliteCommandClassifier implements AutoCloseable {
         return marginThreshold;
     }
 
+    public float getThresholdForLabel(String label) {
+        if ("off".equals(label)) {
+            return offThreshold;
+        }
+        if ("on".equals(label)) {
+            return onThreshold;
+        }
+        return threshold;
+    }
+
+    public float getMarginThresholdForLabel(String label) {
+        if ("off".equals(label)) {
+            return offMarginThreshold;
+        }
+        if ("on".equals(label)) {
+            return onMarginThreshold;
+        }
+        return marginThreshold;
+    }
+
     public int getCooldownMs() {
         return cooldownMs;
+    }
+
+    public float getCommandGateMargin() {
+        return commandGateMargin;
+    }
+
+    public float getCommandGateMaxNoiseProbability() {
+        return commandGateMaxNoiseProbability;
+    }
+
+    public int getTriggerStabilityFrames() {
+        return triggerStabilityFrames;
+    }
+
+    public float getProbabilityForLabel(Prediction prediction, String label) {
+        int labelIndex = indexOfLabel(label);
+        if (labelIndex < 0 || prediction.probabilities == null || labelIndex >= prediction.probabilities.length) {
+            return 0f;
+        }
+        return prediction.probabilities[labelIndex];
     }
 
     @Override
     public void close() {
         interpreter.close();
+    }
+
+    private float[] calibrateProbabilities(float[] rawProbabilities) {
+        float[] calibrated = rawProbabilities.clone();
+        float total = 0f;
+        for (int index = 0; index < calibrated.length; index++) {
+            if ("on".equals(labels[index])) {
+                calibrated[index] *= onScoreScale;
+            } else if ("off".equals(labels[index])) {
+                calibrated[index] *= offScoreScale;
+            }
+            total += calibrated[index];
+        }
+        if (total <= 1e-6f) {
+            return calibrated;
+        }
+        for (int index = 0; index < calibrated.length; index++) {
+            calibrated[index] /= total;
+        }
+        return calibrated;
+    }
+
+    private int indexOfLabel(String label) {
+        for (int index = 0; index < labels.length; index++) {
+            if (labels[index].equals(label)) {
+                return index;
+            }
+        }
+        return -1;
     }
 
     private float[][] computeLogMel(float[] samples) {

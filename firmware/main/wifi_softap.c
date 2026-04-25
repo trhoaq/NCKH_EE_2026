@@ -4,8 +4,10 @@
 
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "protocol.h"
 
 static const char *TAG = "wifi_softap";
 static const char *SOFTAP_SSID = "VoiceWakewordESP";
@@ -30,10 +32,14 @@ static void wifi_event_handler(void *arg,
     }
 }
 
-esp_err_t wifi_softap_start(void) {
+esp_err_t app_wifi_softap_start(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    if (ap_netif == NULL) {
+        ESP_LOGE(TAG, "Could not create default Wi-Fi AP netif");
+        return ESP_FAIL;
+    }
 
     wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
@@ -61,6 +67,21 @@ esp_err_t wifi_softap_start(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "SoftAP ready: SSID=%s password=%s", SOFTAP_SSID, SOFTAP_PASSWORD);
+    esp_netif_ip_info_t ip_info = {0};
+    esp_err_t ip_result = esp_netif_get_ip_info(ap_netif, &ip_info);
+    if (ip_result == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "SoftAP ready: SSID=%s password=%s host=" IPSTR " port=%d",
+                 SOFTAP_SSID,
+                 SOFTAP_PASSWORD,
+                 IP2STR(&ip_info.ip),
+                 VCP_DEFAULT_PORT);
+    } else {
+        ESP_LOGW(TAG,
+                 "SoftAP ready but could not read IP info: %s; port=%d",
+                 esp_err_to_name(ip_result),
+                 VCP_DEFAULT_PORT);
+        ESP_LOGI(TAG, "SoftAP ready: SSID=%s password=%s", SOFTAP_SSID, SOFTAP_PASSWORD);
+    }
     return ESP_OK;
 }

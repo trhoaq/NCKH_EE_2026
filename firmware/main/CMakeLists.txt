@@ -4,6 +4,7 @@ idf_component_register(
         "wifi_softap.c"
         "tcp_audio_server.c"
         "command_router.c"
+        "led_test.c"
         INCLUDE_DIRS
         "."
         REQUIRES
@@ -13,4 +14,5 @@ idf_component_register(
         nvs_flash
         lwip
         driver
+        led_strip
 )

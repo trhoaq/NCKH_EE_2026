@@ -8,6 +8,8 @@ import java.io.IOException;
 import java.util.ArrayDeque;
 
 public final class StreamingCommandRecognizer {
+    private static final int MAX_CONSECUTIVE_READ_ERRORS = 5;
+
     public interface Listener {
         void onCommandDetected(TfliteCommandClassifier.Prediction prediction);
         void onDebugPrediction(TfliteCommandClassifier.Prediction prediction);
@@ -25,6 +27,8 @@ public final class StreamingCommandRecognizer {
     private AudioRecord audioRecord;
     private TfliteCommandClassifier classifier;
     private long lastTriggerAtMs;
+    private int stableCommandFrames;
+    private String stableCommandLabel;
     private final ArrayDeque<float[]> probabilityHistory = new ArrayDeque<>();
 
     public StreamingCommandRecognizer(Context context, String modelAssetName, String metadataAssetName, Listener listener) {
@@ -65,6 +69,8 @@ public final class StreamingCommandRecognizer {
         running = true;
         probabilityHistory.clear();
         lastTriggerAtMs = 0L;
+        stableCommandFrames = 0;
+        stableCommandLabel = null;
         workerThread = new Thread(this::runLoop, "command-recognizer-thread");
         workerThread.start();
     }
@@ -100,17 +106,30 @@ public final class StreamingCommandRecognizer {
         int writePosition = 0;
         int totalSamples = 0;
         int samplesSinceLastInference = 0;
+        int consecutiveReadErrors = 0;
 
         try {
             audioRecord.startRecording();
+            if (audioRecord.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+                listener.onError("Recognizer could not enter recording state");
+                return;
+            }
             listener.onStatus("DL recognizer listening...");
 
             while (running) {
                 int samplesRead = audioRecord.read(captureChunk, 0, captureChunk.length);
-                if (samplesRead <= 0) {
-                    listener.onError("Audio capture failed");
-                    break;
+                if (samplesRead == 0) {
+                    continue;
                 }
+                if (samplesRead < 0) {
+                    consecutiveReadErrors++;
+                    if (consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS) {
+                        listener.onError("Audio capture failed: read code " + samplesRead);
+                        break;
+                    }
+                    continue;
+                }
+                consecutiveReadErrors = 0;
 
                 for (int index = 0; index < samplesRead; index++) {
                     ringBuffer[writePosition] = captureChunk[index];
@@ -136,13 +155,21 @@ public final class StreamingCommandRecognizer {
                 TfliteCommandClassifier.Prediction smoothed = smoothPrediction(prediction);
                 listener.onDebugPrediction(smoothed);
                 if (smoothed.actionId == 0) {
+                    resetCommandGate();
+                    continue;
+                }
+                if (!passesCommandGate(smoothed)) {
+                    resetCommandGate();
+                    continue;
+                }
+                if (!advanceCommandGate(smoothed.label)) {
                     continue;
                 }
                 long now = System.currentTimeMillis();
-                if (smoothed.confidence < classifier.getThreshold()) {
+                if (smoothed.confidence < classifier.getThresholdForLabel(smoothed.label)) {
                     continue;
                 }
-                if (smoothed.margin < classifier.getMarginThreshold()) {
+                if (smoothed.margin < classifier.getMarginThresholdForLabel(smoothed.label)) {
                     continue;
                 }
                 if (now - lastTriggerAtMs < classifier.getCooldownMs()) {
@@ -151,9 +178,14 @@ public final class StreamingCommandRecognizer {
 
                 lastTriggerAtMs = now;
                 listener.onCommandDetected(smoothed);
+                resetCommandGate();
             }
-        } catch (RuntimeException error) {
-            listener.onError("Recognizer runtime failed: " + error.getMessage());
+        } catch (Throwable error) {
+            String message = error.getMessage();
+            listener.onError("Recognizer runtime failed: "
+                    + (message == null || message.trim().isEmpty()
+                    ? error.getClass().getSimpleName()
+                    : message));
         } finally {
             running = false;
             releaseAudioRecord();
@@ -223,6 +255,29 @@ public final class StreamingCommandRecognizer {
         System.arraycopy(ringBuffer, writePosition, output, 0, tail);
         System.arraycopy(ringBuffer, 0, output, tail, writePosition);
         return output;
+    }
+
+    private boolean passesCommandGate(TfliteCommandClassifier.Prediction prediction) {
+        float unknownProbability = classifier.getProbabilityForLabel(prediction, "unknown");
+        float silenceProbability = classifier.getProbabilityForLabel(prediction, "silence");
+        float maxNoiseProbability = Math.max(unknownProbability, silenceProbability);
+        return prediction.confidence - maxNoiseProbability >= classifier.getCommandGateMargin()
+                && maxNoiseProbability <= classifier.getCommandGateMaxNoiseProbability();
+    }
+
+    private boolean advanceCommandGate(String label) {
+        if (label.equals(stableCommandLabel)) {
+            stableCommandFrames++;
+        } else {
+            stableCommandLabel = label;
+            stableCommandFrames = 1;
+        }
+        return stableCommandFrames >= classifier.getTriggerStabilityFrames();
+    }
+
+    private void resetCommandGate() {
+        stableCommandFrames = 0;
+        stableCommandLabel = null;
     }
 
     private void releaseAudioRecord() {

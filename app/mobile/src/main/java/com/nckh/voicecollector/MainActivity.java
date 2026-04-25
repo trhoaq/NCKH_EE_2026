@@ -4,6 +4,11 @@ import android.Manifest;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.MediaRecorder;
+import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -16,6 +21,7 @@ import android.widget.RadioGroup;
 import android.widget.TextView;
 import android.widget.Toast;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -342,12 +348,18 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        Network espNetwork = findEspWifiNetwork();
+        if (espNetwork == null) {
+            updateStatus("Phone is not on ESP Wi-Fi (expected 192.168.4.x)");
+            return;
+        }
+
         isRecording = true;
         renderButtonState();
-        updateStatus("Connecting to ESP " + host + ":" + port + "...");
+        updateStatus("Connecting to ESP " + host + ":" + port + " via Wi-Fi...");
 
         ioExecutor.execute(() -> {
-            EspAudioClient client = new EspAudioClient(host, port);
+            EspAudioClient client = new EspAudioClient(host, port, espNetwork.getSocketFactory());
             try {
                 client.connectAndReadHello();
                 activeEspClient = client;
@@ -375,41 +387,37 @@ public class MainActivity extends AppCompatActivity {
 
     private void startCommandRecognizer() {
         stopCommandRecognizer();
-        commandRecognizer = new StreamingCommandRecognizer(
-                this,
-                COMMAND_MODEL_ASSET,
-                COMMAND_MODEL_META_ASSET,
-                new StreamingCommandRecognizer.Listener() {
-                    @Override
-                    public void onCommandDetected(TfliteCommandClassifier.Prediction prediction) {
-                        mainHandler.post(() -> handleDetectedCommand(prediction));
-                    }
-
-                    @Override
-                    public void onDebugPrediction(TfliteCommandClassifier.Prediction prediction) {
-                        mainHandler.post(() -> updateDebugPrediction(prediction));
-                    }
-
-                    @Override
-                    public void onStatus(String message) {
-                        mainHandler.post(() -> updateStatus(message));
-                    }
-
-                    @Override
-                    public void onError(String message) {
-                        mainHandler.post(() -> {
-                            updateStatus(message);
-                            stopEspListening();
-                        });
-                    }
-                }
-        );
-
         try {
+            commandRecognizer = new StreamingCommandRecognizer(
+                    this,
+                    COMMAND_MODEL_ASSET,
+                    COMMAND_MODEL_META_ASSET,
+                    new StreamingCommandRecognizer.Listener() {
+                        @Override
+                        public void onCommandDetected(TfliteCommandClassifier.Prediction prediction) {
+                            mainHandler.post(() -> handleDetectedCommand(prediction));
+                        }
+
+                        @Override
+                        public void onDebugPrediction(TfliteCommandClassifier.Prediction prediction) {
+                            mainHandler.post(() -> updateDebugPrediction(prediction));
+                        }
+
+                        @Override
+                        public void onStatus(String message) {
+                            mainHandler.post(() -> updateStatus(message));
+                        }
+
+                        @Override
+                        public void onError(String message) {
+                            mainHandler.post(() -> failEspListening(message));
+                        }
+                    }
+            );
             commandRecognizer.start();
-        } catch (IOException error) {
-            updateStatus("Could not start DL recognizer: " + error.getMessage());
-            stopEspListening();
+        } catch (Throwable error) {
+            commandRecognizer = null;
+            failEspListening("Could not start DL recognizer: " + safeErrorMessage(error));
         }
     }
 
@@ -460,26 +468,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void stopEspListening() {
-        boolean wasRunning = isRecording;
-        isRecording = false;
-        stopCommandRecognizer();
-
-        EspAudioClient currentClient = activeEspClient;
-        activeEspClient = null;
-        if (currentClient != null) {
-            ioExecutor.execute(() -> {
-                try {
-                    currentClient.close();
-                } catch (IOException ignored) {
-                    // Already closing.
-                }
-            });
-        }
-
-        if (wasRunning) {
-            updateStatus("ESP command listening stopped");
-        }
-        renderButtonState();
+        shutdownEspListening("ESP command listening stopped");
     }
 
     private void dispatchEspCommand(TfliteCommandClassifier.Prediction prediction) {
@@ -516,9 +505,15 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        Network espNetwork = findEspWifiNetwork();
+        if (espNetwork == null) {
+            updateStatus("Phone is not on ESP Wi-Fi (expected 192.168.4.x)");
+            return;
+        }
+
         updateStatus("Checking ESP connection...");
         ioExecutor.execute(() -> {
-            EspAudioClient client = new EspAudioClient(host, port);
+            EspAudioClient client = new EspAudioClient(host, port, espNetwork.getSocketFactory());
             try {
                 EspAudioClient.ServerHello hello = client.connectAndReadHello();
                 mainHandler.post(() -> {
@@ -659,11 +654,75 @@ public class MainActivity extends AppCompatActivity {
         mainHandler.post(() -> updateStatus(message));
     }
 
+    private void failEspListening(String message) {
+        shutdownEspListening(message);
+    }
+
+    private String safeErrorMessage(Throwable error) {
+        String message = error.getMessage();
+        if (message == null || message.trim().isEmpty()) {
+            return error.getClass().getSimpleName();
+        }
+        return message;
+    }
+
+    private void shutdownEspListening(String statusMessage) {
+        isRecording = false;
+        stopCommandRecognizer();
+
+        EspAudioClient currentClient = activeEspClient;
+        activeEspClient = null;
+        if (currentClient != null) {
+            ioExecutor.execute(() -> {
+                try {
+                    currentClient.close();
+                } catch (IOException ignored) {
+                    // Already closing.
+                }
+            });
+        }
+
+        updateStatus(statusMessage);
+        renderButtonState();
+    }
+
     private void setTransportControlsEnabled(boolean enabled) {
         transportModeRadioGroup.setEnabled(enabled);
         for (int index = 0; index < transportModeRadioGroup.getChildCount(); index++) {
             transportModeRadioGroup.getChildAt(index).setEnabled(enabled);
         }
+    }
+
+    @Nullable
+    private Network findEspWifiNetwork() {
+        ConnectivityManager connectivityManager = getSystemService(ConnectivityManager.class);
+        if (connectivityManager == null) {
+            return null;
+        }
+
+        for (Network network : connectivityManager.getAllNetworks()) {
+            NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+            if (capabilities == null || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                continue;
+            }
+
+            LinkProperties linkProperties = connectivityManager.getLinkProperties(network);
+            if (linkProperties == null) {
+                continue;
+            }
+
+            for (LinkAddress linkAddress : linkProperties.getLinkAddresses()) {
+                if (!(linkAddress.getAddress() instanceof java.net.Inet4Address)) {
+                    continue;
+                }
+                String hostAddress = linkAddress.getAddress().getHostAddress();
+                if (hostAddress != null && hostAddress.startsWith("192.168.4.")) {
+                    return network;
+                }
+            }
+        }
+
+        return null;
     }
 
     public static String formatDuration(long durationMs) {
