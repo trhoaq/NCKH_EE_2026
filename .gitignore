@@ -18,7 +18,10 @@ app_test/.idea/
 model/lightwake/.work/
 model/data/
 model/test/
-firmware/build
+firmware/build/
+firmware/managed_components/
+firmware/components/
 .codex/
 .vscode/
 build/
+__pycache__/

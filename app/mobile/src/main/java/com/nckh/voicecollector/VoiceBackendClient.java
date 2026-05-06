@@ -11,7 +11,9 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -44,30 +46,26 @@ public class VoiceBackendClient {
 
     public RecordingItem uploadRecording(String baseUrl, File audioFile, String note, long durationMs)
             throws IOException, JSONException {
-        String boundary = "Boundary-" + UUID.randomUUID();
-        HttpURLConnection connection = openConnection(buildEndpoint(baseUrl, "/recordings"), "POST");
-        connection.setDoOutput(true);
-        connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+        List<String> mimeTypesToTry = buildMimeTypeCandidates(audioFile);
+        IOException lastError = null;
 
-        try (DataOutputStream outputStream = new DataOutputStream(
-                new BufferedOutputStream(connection.getOutputStream()))) {
-            writeFormField(outputStream, boundary, "note", note == null ? "" : note);
-            writeFormField(outputStream, boundary, "duration_ms", String.valueOf(durationMs));
-            writeFileField(outputStream, boundary, "audio", audioFile);
-            outputStream.writeBytes("--" + boundary + "--\r\n");
-            outputStream.flush();
+        for (int index = 0; index < mimeTypesToTry.size(); index++) {
+            String mimeType = mimeTypesToTry.get(index);
+            try {
+                return uploadRecordingWithMimeType(baseUrl, audioFile, note, durationMs, mimeType);
+            } catch (HttpStatusException error) {
+                if (error.statusCode != 415 || index == mimeTypesToTry.size() - 1) {
+                    throw error;
+                }
+                lastError = error;
+            }
         }
 
-        int responseCode = connection.getResponseCode();
-        String responseBody = readResponseBody(connection, responseCode);
-        connection.disconnect();
-
-        if (responseCode < 200 || responseCode >= 300) {
-            throw new IOException(extractErrorMessage(responseBody, responseCode));
+        if (lastError != null) {
+            throw lastError;
         }
 
-        JSONObject payload = new JSONObject(responseBody);
-        return RecordingItem.fromJson(payload.getJSONObject("recording"));
+        throw new IOException("Upload failed before sending request");
     }
 
     private HttpURLConnection openConnection(String targetUrl, String method) throws IOException {
@@ -96,13 +94,20 @@ public class VoiceBackendClient {
         outputStream.writeBytes("\r\n");
     }
 
-    private void writeFileField(DataOutputStream outputStream, String boundary, String fieldName, File file)
+    private void writeFileField(
+            DataOutputStream outputStream,
+            String boundary,
+            String fieldName,
+            File file,
+            String mimeType
+    )
             throws IOException {
         outputStream.writeBytes("--" + boundary + "\r\n");
         outputStream.writeBytes(
                 "Content-Disposition: form-data; name=\"" + fieldName + "\"; filename=\"" + file.getName() + "\"\r\n"
         );
-        outputStream.writeBytes("Content-Type: audio/mp4\r\n\r\n");
+        outputStream.writeBytes("Content-Type: " + mimeType + "\r\n");
+        outputStream.writeBytes("Content-Transfer-Encoding: binary\r\n\r\n");
 
         try (BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(file))) {
             byte[] buffer = new byte[8192];
@@ -148,5 +153,63 @@ public class VoiceBackendClient {
         }
 
         return responseBody;
+    }
+
+    private RecordingItem uploadRecordingWithMimeType(
+            String baseUrl,
+            File audioFile,
+            String note,
+            long durationMs,
+            String mimeType
+    ) throws IOException, JSONException {
+        String boundary = "Boundary-" + UUID.randomUUID();
+        HttpURLConnection connection = openConnection(buildEndpoint(baseUrl, "/recordings"), "POST");
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+
+        try {
+            try (DataOutputStream outputStream = new DataOutputStream(
+                    new BufferedOutputStream(connection.getOutputStream()))) {
+                writeFormField(outputStream, boundary, "note", note == null ? "" : note);
+                writeFormField(outputStream, boundary, "duration_ms", String.valueOf(durationMs));
+                writeFileField(outputStream, boundary, "audio", audioFile, mimeType);
+                outputStream.writeBytes("--" + boundary + "--\r\n");
+                outputStream.flush();
+            }
+
+            int responseCode = connection.getResponseCode();
+            String responseBody = readResponseBody(connection, responseCode);
+            if (responseCode < 200 || responseCode >= 300) {
+                throw new HttpStatusException(responseCode, extractErrorMessage(responseBody, responseCode));
+            }
+
+            JSONObject payload = new JSONObject(responseBody);
+            return RecordingItem.fromJson(payload.getJSONObject("recording"));
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private List<String> buildMimeTypeCandidates(File audioFile) {
+        String fileName = audioFile.getName().toLowerCase(Locale.US);
+        if (fileName.endsWith(".m4a")) {
+            return Arrays.asList("audio/mp4", "audio/x-m4a", "audio/m4a", "application/octet-stream");
+        }
+        if (fileName.endsWith(".wav")) {
+            return Arrays.asList("audio/wav", "audio/x-wav", "application/octet-stream");
+        }
+        if (fileName.endsWith(".mp3")) {
+            return Arrays.asList("audio/mpeg", "application/octet-stream");
+        }
+        return Arrays.asList("application/octet-stream");
+    }
+
+    private static final class HttpStatusException extends IOException {
+        final int statusCode;
+
+        HttpStatusException(int statusCode, String message) {
+            super(message);
+            this.statusCode = statusCode;
+        }
     }
 }

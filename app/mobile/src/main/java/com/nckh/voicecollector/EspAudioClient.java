@@ -14,6 +14,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 public class EspAudioClient implements Closeable {
     private static final int MAGIC = 0x56435031;
@@ -32,24 +33,49 @@ public class EspAudioClient implements Closeable {
     private final String host;
     private final int port;
     private final SocketFactory socketFactory;
+    private final boolean allowDefaultSocketFallback;
 
     private Socket socket;
     private DataInputStream inputStream;
     private DataOutputStream outputStream;
 
     public EspAudioClient(String host, int port) {
-        this(host, port, SocketFactory.getDefault());
+        this(host, port, SocketFactory.getDefault(), false);
     }
 
     public EspAudioClient(String host, int port, SocketFactory socketFactory) {
+        this(host, port, socketFactory, true);
+    }
+
+    private EspAudioClient(String host, int port, SocketFactory socketFactory, boolean allowDefaultSocketFallback) {
         this.host = host;
         this.port = port;
         this.socketFactory = socketFactory;
+        this.allowDefaultSocketFallback = allowDefaultSocketFallback;
     }
 
     public ServerHello connectAndReadHello() throws IOException {
-        socket = socketFactory.createSocket();
-        socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+        try {
+            openSocket(socketFactory);
+        } catch (IOException primaryError) {
+            if (!allowDefaultSocketFallback || !isNetworkBindingPermissionError(primaryError)) {
+                throw primaryError;
+            }
+
+            closeAfterFailedOpen();
+            try {
+                openSocket(SocketFactory.getDefault());
+            } catch (IOException fallbackError) {
+                IOException combinedError = new IOException(
+                        "Network-bound socket failed: " + primaryError.getMessage()
+                                + "; default socket fallback failed: " + fallbackError.getMessage(),
+                        fallbackError
+                );
+                combinedError.addSuppressed(primaryError);
+                throw combinedError;
+            }
+        }
+
         socket.setTcpNoDelay(true);
         socket.setSoTimeout(SO_TIMEOUT_MS);
 
@@ -73,6 +99,34 @@ public class EspAudioClient implements Closeable {
                 inputStream.readInt(),
                 inputStream.readInt() == 1
         );
+    }
+
+    private void openSocket(SocketFactory factory) throws IOException {
+        socket = factory.createSocket();
+        socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+    }
+
+    private boolean isNetworkBindingPermissionError(IOException error) {
+        String message = error.getMessage();
+        if (message == null) {
+            return false;
+        }
+
+        String lowerMessage = message.toLowerCase(Locale.US);
+        return lowerMessage.contains("eperm")
+                || lowerMessage.contains("operation not permitted")
+                || lowerMessage.contains("binding socket to network");
+    }
+
+    private void closeAfterFailedOpen() {
+        try {
+            close();
+        } catch (IOException ignored) {
+            // Preserve the original connection failure; cleanup failure is not actionable here.
+        }
+        socket = null;
+        inputStream = null;
+        outputStream = null;
     }
 
     public void sendSessionStart(int sessionId, ServerHello hello, int keywordSetVersion) throws IOException {

@@ -3,6 +3,7 @@ package com.nckh.voicecollector;
 import android.Manifest;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
 import android.net.LinkAddress;
@@ -20,10 +21,10 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.TextView;
 import android.widget.Toast;
-import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -40,7 +41,6 @@ import java.util.concurrent.ThreadLocalRandom;
 import org.json.JSONException;
 
 public class MainActivity extends AppCompatActivity {
-    private static final int REQUEST_RECORD_AUDIO_PERMISSION = 1001;
     private static final String PREFS_NAME = "voice_collector_prefs";
     private static final String PREF_BACKEND_URL = "backend_url";
     private static final String PREF_TRANSPORT_MODE = "transport_mode";
@@ -58,6 +58,18 @@ public class MainActivity extends AppCompatActivity {
     private final VoiceBackendClient backendClient = new VoiceBackendClient();
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ActivityResultLauncher<String> recordAudioPermissionLauncher =
+            registerForActivityResult(new ActivityResultContracts.RequestPermission(), isGranted -> {
+                if (isGranted) {
+                    if (isEspMode()) {
+                        startEspListening();
+                    } else {
+                        startRecording();
+                    }
+                } else {
+                    updateStatus("Microphone permission denied");
+                }
+            });
 
     private RadioGroup transportModeRadioGroup;
     private LinearLayout backendSection;
@@ -210,11 +222,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        ActivityCompat.requestPermissions(
-                this,
-                new String[]{Manifest.permission.RECORD_AUDIO},
-                REQUEST_RECORD_AUDIO_PERMISSION
-        );
+        recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO);
     }
 
     private void saveTransportSettings() {
@@ -239,7 +247,9 @@ public class MainActivity extends AppCompatActivity {
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
         currentRecordingFile = new File(recordingDirectory, "voice_" + timestamp + ".m4a");
 
-        mediaRecorder = new MediaRecorder();
+        mediaRecorder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                ? new MediaRecorder(this)
+                : new MediaRecorder();
         mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
         mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
         mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
@@ -590,26 +600,6 @@ public class MainActivity extends AppCompatActivity {
         stopEspListening();
         releaseRecorder();
         ioExecutor.shutdownNow();
-    }
-
-    @Override
-    public void onRequestPermissionsResult(
-            int requestCode,
-            @NonNull String[] permissions,
-            @NonNull int[] grantResults
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQUEST_RECORD_AUDIO_PERMISSION) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                if (isEspMode()) {
-                    startEspListening();
-                } else {
-                    startRecording();
-                }
-            } else {
-                updateStatus("Microphone permission denied");
-            }
-        }
     }
 
     private int parseEspPort() {

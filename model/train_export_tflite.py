@@ -24,6 +24,13 @@ ON_CLASS_WEIGHT_SCALE = 1.15
 OFF_CLASS_WEIGHT_SCALE = 0.95
 OFF_THRESHOLD_OFFSET = 0.06
 OFF_MARGIN_THRESHOLD_OFFSET = 0.03
+ON_THRESHOLD = 0.55
+COMMAND_GATE_MARGIN = 0.18
+COMMAND_GATE_MAX_NOISE_PROBABILITY = 0.32
+TRIGGER_STABILITY_FRAMES = 2
+ON_AUGMENTATIONS_PER_SAMPLE = 2
+OFF_AUGMENTATIONS_PER_SAMPLE = 1
+UNKNOWN_AUGMENTATIONS_PER_SAMPLE = 0
 
 
 def read_wav_mono(path: Path):
@@ -60,6 +67,43 @@ def normalize_amplitude(samples: np.ndarray):
     if peak < 1e-5:
         return samples.astype(np.float32, copy=False)
     return (samples / peak).astype(np.float32)
+
+
+def speed_perturb(samples: np.ndarray, factor: float):
+    if samples.size <= 1 or abs(factor - 1.0) < 1e-4:
+        return samples.astype(np.float32, copy=False)
+    output_length = max(1, int(round(samples.shape[0] / factor)))
+    source_positions = np.linspace(0.0, samples.shape[0] - 1, output_length, dtype=np.float32)
+    left = np.floor(source_positions).astype(np.int32)
+    right = np.minimum(left + 1, samples.shape[0] - 1)
+    alpha = source_positions - left
+    return (samples[left] * (1.0 - alpha) + samples[right] * alpha).astype(np.float32)
+
+
+def augment_audio(samples: np.ndarray, sample_rate: int, rng: np.random.Generator):
+    augmented = resample_linear(samples, sample_rate, SAMPLE_RATE)
+    augmented = speed_perturb(augmented, float(rng.uniform(0.92, 1.08)))
+
+    if augmented.size > 1:
+        shift = int(rng.integers(-1200, 1201))
+        if shift != 0:
+            augmented = np.roll(augmented, shift)
+            if shift > 0:
+                augmented[:shift] = 0.0
+            else:
+                augmented[shift:] = 0.0
+
+    gain = float(rng.uniform(0.65, 1.35))
+    noise_level = float(rng.uniform(0.001, 0.012))
+    noise = rng.normal(0.0, noise_level, augmented.shape[0]).astype(np.float32)
+    augmented = (augmented * gain) + noise
+
+    if rng.random() < 0.35 and augmented.size > 800:
+        dropout_length = int(rng.integers(120, 480))
+        start = int(rng.integers(0, max(1, augmented.size - dropout_length)))
+        augmented[start:start + dropout_length] *= float(rng.uniform(0.05, 0.35))
+
+    return np.clip(augmented, -1.0, 1.0).astype(np.float32)
 
 
 def trim_silence(samples: np.ndarray):
@@ -103,6 +147,10 @@ def preprocess_audio(samples: np.ndarray, sample_rate: int):
     return fit_to_window(trim_silence(normalize_amplitude(resample_linear(samples, sample_rate, SAMPLE_RATE))))
 
 
+def preprocess_resampled_audio(samples: np.ndarray):
+    return fit_to_window(trim_silence(normalize_amplitude(samples)))
+
+
 def synthesize_silence(seed: int):
     rng = np.random.default_rng(seed)
     base = rng.normal(0.0, 0.003, WINDOW_SAMPLES).astype(np.float32)
@@ -141,13 +189,18 @@ def collect_wavs(directory: Path):
     return sorted(path for path in directory.glob("*.wav"))
 
 
-def build_features(paths, label_index):
+def build_features(paths, label_index, augmentations_per_sample, seed):
     features = []
     labels = []
-    for path in paths:
+    for index, path in enumerate(paths):
         samples, sample_rate = read_wav_mono(path)
         features.append(compute_log_mel(preprocess_audio(samples, sample_rate)))
         labels.append(label_index)
+        for augmentation_index in range(augmentations_per_sample):
+            rng = np.random.default_rng(seed + (label_index + 1) * 1000003 + index * 9176 + augmentation_index)
+            augmented = augment_audio(samples, sample_rate, rng)
+            features.append(compute_log_mel(preprocess_resampled_audio(augmented)))
+            labels.append(label_index)
     return features, labels
 
 
@@ -344,21 +397,34 @@ def main():
     parser.add_argument("--eval-on-wav")
     parser.add_argument("--eval-off-wav")
     parser.add_argument("--calibration-repeats", type=int, default=32)
+    parser.add_argument("--on-augmentations", type=int, default=ON_AUGMENTATIONS_PER_SAMPLE)
+    parser.add_argument("--off-augmentations", type=int, default=OFF_AUGMENTATIONS_PER_SAMPLE)
+    parser.add_argument("--unknown-augmentations", type=int, default=UNKNOWN_AUGMENTATIONS_PER_SAMPLE)
     args = parser.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
 
+    if args.eval_on_wav and not Path(args.eval_on_wav).exists():
+        raise FileNotFoundError(f"eval on wav not found: {args.eval_on_wav}")
+    if args.eval_off_wav and not Path(args.eval_off_wav).exists():
+        raise FileNotFoundError(f"eval off wav not found: {args.eval_off_wav}")
+
     features = []
     labels = []
 
-    on_features, on_labels = build_features(collect_wavs(Path(args.on_dir)), 0)
-    off_features, off_labels = build_features(collect_wavs(Path(args.off_dir)), 1)
+    on_features, on_labels = build_features(collect_wavs(Path(args.on_dir)), 0, args.on_augmentations, args.seed)
+    off_features, off_labels = build_features(collect_wavs(Path(args.off_dir)), 1, args.off_augmentations, args.seed)
     unknown_paths = []
     for directory in args.unknown_dir:
         unknown_paths.extend(collect_wavs(Path(directory)))
-    unknown_features, unknown_labels = build_features(sorted(unknown_paths), 2)
+    unknown_features, unknown_labels = build_features(
+        sorted(unknown_paths),
+        2,
+        args.unknown_augmentations,
+        args.seed,
+    )
 
     silence_features = []
     silence_labels = []
@@ -409,7 +475,7 @@ def main():
     val_x = (val_x - feature_mean.reshape(1, 1, MEL_BINS, 1)) / feature_std.reshape(1, 1, MEL_BINS, 1)
     threshold = 0.60
     margin_threshold = 0.10
-    on_threshold = threshold
+    on_threshold = ON_THRESHOLD
     off_threshold = threshold + OFF_THRESHOLD_OFFSET
     on_margin_threshold = margin_threshold
     off_margin_threshold = margin_threshold + OFF_MARGIN_THRESHOLD_OFFSET
@@ -522,10 +588,18 @@ def main():
                 "off_threshold": off_threshold,
                 "on_margin_threshold": on_margin_threshold,
                 "off_margin_threshold": off_margin_threshold,
+                "command_gate_margin": COMMAND_GATE_MARGIN,
+                "command_gate_max_noise_probability": COMMAND_GATE_MAX_NOISE_PROBABILITY,
+                "trigger_stability_frames": TRIGGER_STABILITY_FRAMES,
                 "smoothing_windows": 3,
                 "cooldown_ms": 1200,
                 "feature_mean": feature_mean.tolist(),
                 "feature_std": feature_std.tolist(),
+                "augmentation": {
+                    "on_per_sample": args.on_augmentations,
+                    "off_per_sample": args.off_augmentations,
+                    "unknown_per_sample": args.unknown_augmentations,
+                },
             },
             indent=2,
         ),

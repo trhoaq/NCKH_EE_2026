@@ -4,6 +4,7 @@ idf_component_register(
         "wifi_softap.c"
         "tcp_audio_server.c"
         "command_router.c"
+        "actuator.c"
         "led_test.c"
         INCLUDE_DIRS
         "."

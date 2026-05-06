@@ -1,7 +1,6 @@
 import argparse
 import importlib.util
 import json
-import math
 import time
 import wave
 from pathlib import Path
@@ -70,7 +69,7 @@ def normalize_amplitude(samples):
     return (samples / peak).astype(np.float32)
 
 
-def trim_silence(samples, frame_size, frame_hop):
+def trim_silence(samples, frame_size, frame_hop, window_samples):
     if samples.size <= frame_size:
         return samples
     frame_count = 1 + max(0, (samples.shape[0] - frame_size) // frame_hop)
@@ -83,7 +82,7 @@ def trim_silence(samples, frame_size, frame_hop):
     threshold = max(float(rms.max()) * 0.12, 0.01)
     active = np.where(rms >= threshold)[0]
     if active.size == 0:
-        return samples
+        return samples[: min(samples.shape[0], window_samples)]
     start_frame = max(0, int(active[0]) - 2)
     end_frame = min(frame_count - 1, int(active[-1]) + 2)
     start = start_frame * frame_hop
@@ -105,15 +104,19 @@ def fit_to_window(samples, window_samples):
     return output
 
 
-def preprocess(samples, sample_rate, meta):
-    samples = resample_linear(samples, sample_rate, meta["sample_rate"])
+def preprocess_resampled(samples, meta):
     samples = normalize_amplitude(samples)
-    samples = trim_silence(samples, meta["frame_size"], meta["frame_hop"])
+    samples = trim_silence(samples, meta["frame_size"], meta["frame_hop"], meta["window_samples"])
     samples = fit_to_window(samples, meta["window_samples"])
     return samples
 
 
-def compute_log_mel(samples, meta):
+def preprocess(samples, sample_rate, meta):
+    samples = resample_linear(samples, sample_rate, meta["sample_rate"])
+    return preprocess_resampled(samples, meta)
+
+
+def compute_spectrograms(samples, meta):
     stft = tf.signal.stft(
         tf.convert_to_tensor(samples, dtype=tf.float32),
         frame_length=meta["frame_size"],
@@ -122,7 +125,7 @@ def compute_log_mel(samples, meta):
         window_fn=tf.signal.hann_window,
         pad_end=False,
     )
-    power = tf.abs(stft) ** 2
+    power = (tf.abs(stft) ** 2).numpy().astype(np.float32)
     mel_matrix = tf.signal.linear_to_mel_weight_matrix(
         num_mel_bins=meta["mel_bins"],
         num_spectrogram_bins=(meta["fft_size"] // 2) + 1,
@@ -130,7 +133,7 @@ def compute_log_mel(samples, meta):
         lower_edge_hertz=20.0,
         upper_edge_hertz=meta["sample_rate"] / 2.0,
     )
-    mel = tf.matmul(power, mel_matrix)
+    mel = tf.matmul(tf.convert_to_tensor(power, dtype=tf.float32), mel_matrix)
     log_mel = tf.math.log(mel + 1e-5)
     log_mel = tf.image.resize(
         log_mel[..., tf.newaxis],
@@ -139,7 +142,80 @@ def compute_log_mel(samples, meta):
 
     mean = np.array(meta["feature_mean"], dtype=np.float32).reshape(1, meta["mel_bins"], 1)
     std = np.array(meta["feature_std"], dtype=np.float32).reshape(1, meta["mel_bins"], 1)
-    return (log_mel - mean) / std
+    normalized_log_mel = (log_mel - mean) / std
+    return power, log_mel, normalized_log_mel
+
+
+def render_visualizations(
+    raw_samples,
+    raw_sample_rate,
+    processed_samples,
+    processed_sample_rate,
+    power_spectrogram,
+    log_mel,
+    wav_path,
+    output_path=None,
+    show=False,
+):
+    if not importlib.util.find_spec("matplotlib"):
+        raise SystemExit(
+            "matplotlib is required for visualization. Install matplotlib or run without visualization flags."
+        )
+
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(4, 1, figsize=(14, 13))
+
+    raw_waveform_time = np.arange(raw_samples.shape[0], dtype=np.float32) / float(raw_sample_rate)
+    axes[0].plot(raw_waveform_time, raw_samples, color="#0f766e", linewidth=0.8)
+    axes[0].set_title("Input WAV Waveform (Before Preprocessing)")
+    axes[0].set_xlabel("Time (s)")
+    axes[0].set_ylabel("Amplitude")
+    axes[0].set_xlim(0.0, raw_waveform_time[-1] if raw_waveform_time.size else 0.0)
+    axes[0].grid(True, alpha=0.25)
+
+    processed_waveform_time = np.arange(processed_samples.shape[0], dtype=np.float32) / float(processed_sample_rate)
+    axes[1].plot(processed_waveform_time, processed_samples, color="#2563eb", linewidth=0.8)
+    axes[1].set_title("Preprocessed WAV Waveform (After Preprocessing)")
+    axes[1].set_xlabel("Time (s)")
+    axes[1].set_ylabel("Amplitude")
+    axes[1].set_xlim(0.0, processed_waveform_time[-1] if processed_waveform_time.size else 0.0)
+    axes[1].grid(True, alpha=0.25)
+
+    stft_image = axes[2].imshow(
+        np.log10(np.maximum(power_spectrogram, 1e-8)).T,
+        origin="lower",
+        aspect="auto",
+        cmap="magma",
+    )
+    axes[2].set_title("STFT Log-Power Spectrogram")
+    axes[2].set_xlabel("Frame")
+    axes[2].set_ylabel("Frequency Bin")
+    figure.colorbar(stft_image, ax=axes[2], fraction=0.046, pad=0.04)
+
+    log_mel_image = axes[3].imshow(
+        np.squeeze(log_mel, axis=-1).T,
+        origin="lower",
+        aspect="auto",
+        cmap="viridis",
+    )
+    axes[3].set_title("Log-Mel Spectrogram")
+    axes[3].set_xlabel("Frame")
+    axes[3].set_ylabel("Mel Bin")
+    figure.colorbar(log_mel_image, ax=axes[3], fraction=0.046, pad=0.04)
+
+    figure.suptitle(f"Audio Features: {Path(wav_path).name}")
+    figure.tight_layout()
+
+    if output_path:
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output, dpi=160, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
 
 
 def main():
@@ -147,16 +223,31 @@ def main():
     parser.add_argument("--model-tflite", required=True)
     parser.add_argument("--model-meta", required=True)
     parser.add_argument("--wav", required=True)
+    parser.add_argument("--show-visualizations", action="store_true")
+    parser.add_argument("--save-visualizations")
     args = parser.parse_args()
 
     meta = json.loads(Path(args.model_meta).read_text(encoding="utf-8"))
 
     preprocess_started_at = time.perf_counter()
-    samples, sample_rate = read_wav_mono(Path(args.wav))
-    samples = preprocess(samples, sample_rate, meta)
-    features = compute_log_mel(samples, meta)
+    raw_samples, raw_sample_rate = read_wav_mono(Path(args.wav))
+    samples = preprocess(raw_samples, raw_sample_rate, meta)
+    power_spectrogram, log_mel, features = compute_spectrograms(samples, meta)
     inputs = features[np.newaxis, ...]
     preprocess_ms = (time.perf_counter() - preprocess_started_at) * 1000.0
+
+    if args.show_visualizations or args.save_visualizations:
+        render_visualizations(
+            raw_samples,
+            raw_sample_rate,
+            samples,
+            meta["sample_rate"],
+            power_spectrogram,
+            log_mel,
+            args.wav,
+            output_path=args.save_visualizations,
+            show=args.show_visualizations,
+        )
 
     interpreter = tf.lite.Interpreter(model_path=args.model_tflite)
     interpreter.allocate_tensors()
